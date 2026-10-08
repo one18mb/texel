@@ -1,0 +1,8 @@
+# 构建产物
+*.exe
+src/*.res
+
+# 点阵字体：由 unifont .hex 重新生成（见 README「构建」）；字体本身为 GPL
+src/font.bin
+unifont*.hex
+unifont*.hex.gz

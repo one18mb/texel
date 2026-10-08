@@ -1,0 +1,65 @@
+#include "resource.h"
+#include <windows.h>
+
+IDI_APP ICON "texel.ico"
+1 24 "texel.manifest"
+
+UNIFONT RCDATA "font.bin"
+
+
+IDD_NEW DIALOGEX 0, 0, 360, 232
+STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "新建画布"
+FONT 9, "MS Shell Dlg"
+BEGIN
+  LTEXT           "宽 (字):", -1, 252, 14, 40, 10
+  EDITTEXT        IDC_W, 294, 12, 56, 12, ES_NUMBER | ES_AUTOHSCROLL
+  LTEXT           "高 (字):", -1, 252, 33, 40, 10
+  EDITTEXT        IDC_H, 294, 31, 56, 12, ES_NUMBER | ES_AUTOHSCROLL
+  LTEXT           "背景色:", -1, 252, 52, 40, 10
+  EDITTEXT        IDC_BG, 294, 50, 56, 12, ES_AUTOHSCROLL
+  LTEXT           "前景色:", -1, 252, 71, 40, 10
+  EDITTEXT        IDC_FG, 294, 69, 56, 12, ES_AUTOHSCROLL
+  PUSHBUTTON      "设为默认值", IDC_SETDEF, 252, 190, 96, 14
+  DEFPUSHBUTTON   "确定", IDOK, 252, 210, 44, 14
+  PUSHBUTTON      "取消", IDCANCEL, 304, 210, 44, 14
+  EDITTEXT        IDC_HELPTEXT, 8, 12, 236, 212, ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL
+END
+
+IDD_SAVE DIALOGEX 0, 0, 220, 70
+STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "字画"
+FONT 9, "MS Shell Dlg"
+BEGIN
+  LTEXT           "尚未保存，是否保存为 PNG？", -1, 12, 12, 196, 24
+  DEFPUSHBUTTON   "是", IDC_SAVE_YES, 12, 46, 42, 14
+  PUSHBUTTON      "否", IDC_SAVE_NO, 58, 46, 42, 14
+  PUSHBUTTON      "否，不再提示", IDC_SAVE_NEVER, 104, 46, 66, 14
+  PUSHBUTTON      "取消", IDCANCEL, 174, 46, 34, 14
+END
+
+1 VERSIONINFO
+FILEVERSION    1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS         0x40004
+FILETYPE       0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName",      "texel"
+      VALUE "FileDescription",  "字画 (texel) - pixel draft pad"
+      VALUE "FileVersion",      "1.0.0.0"
+      VALUE "InternalName",     "texel"
+      VALUE "OriginalFilename", "texel.exe"
+      VALUE "ProductName",      "字画 (texel)"
+      VALUE "ProductVersion",   "1.0.0.0"
+      VALUE "LegalCopyright",   "MIT License"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
