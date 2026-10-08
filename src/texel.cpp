@@ -36,6 +36,7 @@ static int      g_pw = 0, g_ph = 0;
 static uint32_t g_bg = 0xFFFFFF, g_fg = 0x000000;
 
 static std::vector<uint32_t> g_cells;
+static std::vector<uint32_t> g_cellColor;   // 每个字形格的颜色(ARGB)
 static std::vector<uint32_t> g_ink;
 static std::vector<uint32_t> g_text;
 static std::vector<uint32_t> g_fb;
@@ -57,7 +58,8 @@ enum { OP_STROKE = 0, OP_TEXT = 1 };
 struct Op {
   int type=OP_STROKE;
   int r0=0,c0=0,rows=0,cols=0;
-  std::vector<uint32_t> before, after;
+  std::vector<uint32_t> before, after;      // 码点
+  std::vector<uint32_t> beforeC, afterC;    // 颜色(与 before/after 平行)
   int cbx0=0,cby0=0,cbx1=0,cby1=0;
   uint32_t color=0; int size=0;
   std::vector<POINT> pts;
@@ -65,7 +67,9 @@ struct Op {
 static std::vector<Op> g_ops;
 static int             g_pos = 0;
 static std::vector<uint32_t> g_baseCells;   // 基础文字(仍是格子)
+static std::vector<uint32_t> g_baseCellColor;// 基础文字的颜色
 static std::vector<uint32_t> g_baseInk;     // 基础笔迹(已栅格化位图)
+static UINT g_cfCells=0;                    // 私有剪贴板格式: 带色文字块
 
 struct Sw { uint32_t color; int kind; };
 static std::vector<Sw> g_sw;
@@ -103,6 +107,7 @@ static const int HELP_X=4, HELP_Y=4, HELP_W=32, HELP_H=16;
 
 static inline uint32_t RGB24(int r,int g,int b){ return (uint32_t)((r<<16)|(g<<8)|b); }
 static inline uint32_t argb(uint32_t c){ return 0xFF000000u | (c & 0xFFFFFFu); }
+static inline uint32_t textColor(){ return g_brush; }   // 文字用当前色(透明则存透明=不可见)
 static inline int imin(int a,int b){ return a<b?a:b; }
 static inline int imax(int a,int b){ return a>b?a:b; }
 static void stampBuf(uint32_t* buf,int cx,int cy,int r,uint32_t col);
@@ -167,7 +172,7 @@ static void decodeCP(const std::wstring& s,std::vector<uint32_t>& out){
 // 只重排指定行范围的文字层（增量）
 static void renderTextRows(int r0,int r1){
   if(r0<0) r0=0; if(r1>g_H-1) r1=g_H-1;
-  uint32_t bgg=argb(g_bg), fgg=argb(g_fg);
+  uint32_t bgg=argb(g_bg);
   for(int y=r0;y<=r1;y++){
     int by=y*ROWH;
     for(int r=0;r<ROWH;r++){ int py=by+r; if(py<0||py>=g_ph) continue;
@@ -176,13 +181,15 @@ static void renderTextRows(int r0,int r1){
       uint32_t cp=g_cells[(size_t)y*g_cols+c];
       if(!cp||cp==CONT) continue;
       Glyph gl=getGlyph(cp); if(!gl.bits) continue;
+      uint32_t fgc=g_cellColor[(size_t)y*g_cols+c];
+      if((fgc>>24)==0) continue;              // 透明字：字在但无墨
       int bx=c*COLW, maxc=(gl.w==2)?16:8;
       for(int r=0;r<ROWH;r++){
         uint16_t row=(uint16_t)((gl.bits[r*2]<<8)|gl.bits[r*2+1]);
         if(!row) continue;
         int py=by+r; if(py<0||py>=g_ph) continue;
         uint32_t* tline=g_text.data()+(size_t)py*g_pw+bx;
-        for(int k=0;k<maxc;k++){ int px=bx+k; if(px>=g_pw) break; if(row&(0x8000>>k)) tline[k]=fgg; }
+        for(int k=0;k<maxc;k++){ int px=bx+k; if(px>=g_pw) break; if(row&(0x8000>>k)) tline[k]=fgc; }
       }
     }
   }
@@ -249,6 +256,7 @@ static void overlayChanged(){
   invalidatePx(g_prevOverlay);
 }
 static void invalidateStatus(){ RECT c={0,g_TB+g_ph,g_cw,g_ch}; InvalidateRect(g_hwnd,&c,FALSE); }
+static void invalidateTop(){ RECT c={0,0,g_cw,g_TB}; InvalidateRect(g_hwnd,&c,FALSE); }
 
 // ---------------- 格子 ----------------
 static void clearGlyphAt(int row,int col){
@@ -258,13 +266,14 @@ static void clearGlyphAt(int row,int col){
   uint32_t cp=g_cells[(size_t)row*g_cols+start];
   if(!cp||cp==CONT) return;
   Glyph gl=getGlyph(cp); int w=(gl.w==2)?2:1;
-  g_cells[(size_t)row*g_cols+start]=0;
-  if(w==2 && start+1<g_cols) g_cells[(size_t)row*g_cols+start+1]=0;
+  g_cells[(size_t)row*g_cols+start]=0; g_cellColor[(size_t)row*g_cols+start]=0;
+  if(w==2 && start+1<g_cols){ g_cells[(size_t)row*g_cols+start+1]=0; g_cellColor[(size_t)row*g_cols+start+1]=0; }
 }
 static void truncateFuture(){ if((int)g_ops.size()>g_pos) g_ops.resize(g_pos); }
 static int timelineCap(){ int c=g_cw/16; return c<1?1:c; }
 static void baseReset(){
   g_baseCells.assign((size_t)g_H*g_cols,0u);
+  g_baseCellColor.assign((size_t)g_H*g_cols,0u);
   g_baseInk.assign((size_t)g_pw*g_ph,0u);
 }
 static void dropOldest(){
@@ -274,7 +283,7 @@ static void dropOldest(){
     for(int r=0;r<op.rows;r++)
       for(int c=0;c<op.cols;c++){
         int rr=op.r0+r, cc=op.c0+c;
-        if(rr>=0&&rr<g_H&&cc>=0&&cc<g_cols) g_baseCells[(size_t)rr*g_cols+cc]=op.after[(size_t)r*op.cols+c];
+        if(rr>=0&&rr<g_H&&cc>=0&&cc<g_cols){ g_baseCells[(size_t)rr*g_cols+cc]=op.after[(size_t)r*op.cols+c]; g_baseCellColor[(size_t)rr*g_cols+cc]=op.afterC[(size_t)r*op.cols+c]; }
       }
   } else {
     int r=op.size/2;
@@ -295,27 +304,29 @@ static void pushOp(const Op& op){
 
 // ---------------- 文本块快照 ----------------
 static void snapBefore(Op& op){
-  op.before.assign((size_t)op.rows*op.cols,0u);
+  size_t n=(size_t)op.rows*op.cols;
+  op.before.assign(n,0u); op.beforeC.assign(n,0u);
   for(int r=0;r<op.rows;r++)
     for(int c=0;c<op.cols;c++){
       int rr=op.r0+r, cc=op.c0+c;
-      if(rr>=0&&rr<g_H&&cc>=0&&cc<g_cols) op.before[(size_t)r*op.cols+c]=g_cells[(size_t)rr*g_cols+cc];
+      if(rr>=0&&rr<g_H&&cc>=0&&cc<g_cols){ op.before[(size_t)r*op.cols+c]=g_cells[(size_t)rr*g_cols+cc]; op.beforeC[(size_t)r*op.cols+c]=g_cellColor[(size_t)rr*g_cols+cc]; }
     }
 }
 static void snapAfter(Op& op){
-  op.after.assign((size_t)op.rows*op.cols,0u);
+  size_t n=(size_t)op.rows*op.cols;
+  op.after.assign(n,0u); op.afterC.assign(n,0u);
   for(int r=0;r<op.rows;r++)
     for(int c=0;c<op.cols;c++){
       int rr=op.r0+r, cc=op.c0+c;
-      if(rr>=0&&rr<g_H&&cc>=0&&cc<g_cols) op.after[(size_t)r*op.cols+c]=g_cells[(size_t)rr*g_cols+cc];
+      if(rr>=0&&rr<g_H&&cc>=0&&cc<g_cols){ op.after[(size_t)r*op.cols+c]=g_cells[(size_t)rr*g_cols+cc]; op.afterC[(size_t)r*op.cols+c]=g_cellColor[(size_t)rr*g_cols+cc]; }
     }
 }
-static void putGlyph(int row,int col,uint32_t cp){
+static void putGlyph(int row,int col,uint32_t cp,uint32_t color){
   Glyph gl=getGlyph(cp); int w=(gl.bits&&gl.w==2)?2:1;
   if(col+w>g_cols) w=1;
   clearGlyphAt(row,col);
   if(w==2) clearGlyphAt(row,col+1);
-  g_cells[(size_t)row*g_cols+col]=cp;
+  g_cells[(size_t)row*g_cols+col]=cp; g_cellColor[(size_t)row*g_cols+col]=color;
   if(w==2 && col+1<g_cols) g_cells[(size_t)row*g_cols+col+1]=CONT;
 }
 
@@ -333,7 +344,7 @@ static RECT placeChar(uint32_t cp){
   Op op; op.type=OP_TEXT; op.r0=row; op.c0=start; op.rows=1; op.cols=len;
   snapBefore(op);
   int x0=g_cx,y0=g_cy;
-  putGlyph(row,g_cx,cp);
+  putGlyph(row,g_cx,cp,textColor());
   g_cx+=w; if(g_cx>g_cols-1) g_cx=g_cols-1;
   snapAfter(op);
   op.cbx0=x0; op.cby0=y0; op.cbx1=g_cx; op.cby1=g_cy;
@@ -377,23 +388,45 @@ static std::wstring regionText(int c0,int c1,int r0,int r1){
   }
   return out;
 }
-static void setClipboardText(const std::wstring& out){
+// 私有格式：'TXCB' + ver + rows + cols + cp[] + color[]（带色文字块）
+static void buildBlob(int c0,int c1,int r0,int r1,std::vector<uint8_t>& out){
+  int rows=r1-r0+1, cols=c1-c0+1; size_t n=(size_t)rows*cols;
+  out.assign(16+n*8,0);
+  uint32_t* h=(uint32_t*)out.data(); h[0]=0x42435854u; h[1]=1u; h[2]=(uint32_t)rows; h[3]=(uint32_t)cols;
+  uint32_t* cp=(uint32_t*)(out.data()+16);
+  uint32_t* co=(uint32_t*)(out.data()+16+n*4);
+  for(int r=0;r<rows;r++) for(int c=0;c<cols;c++){
+    int rr=r0+r, cc=c0+c, ok=(rr<g_H&&cc<g_cols);
+    cp[(size_t)r*cols+c]= ok? g_cells[(size_t)rr*g_cols+cc] : 0;
+    co[(size_t)r*cols+c]= ok? g_cellColor[(size_t)rr*g_cols+cc] : 0;
+  }
+}
+static void setClipBoth(const std::wstring& text,const std::vector<uint8_t>& blob){
   if(!OpenClipboard(g_hwnd)) return;
   EmptyClipboard();
-  size_t bytes=(out.size()+1)*sizeof(wchar_t);
-  HGLOBAL g=GlobalAlloc(GMEM_MOVEABLE,bytes);
-  if(g){ void* p=GlobalLock(g); if(p){ memcpy(p,out.c_str(),bytes); GlobalUnlock(g); SetClipboardData(CF_UNICODETEXT,g); } }
+  size_t tb=(text.size()+1)*sizeof(wchar_t);
+  HGLOBAL gt=GlobalAlloc(GMEM_MOVEABLE,tb);
+  if(gt){ void* p=GlobalLock(gt); if(p){ memcpy(p,text.c_str(),tb); GlobalUnlock(gt); SetClipboardData(CF_UNICODETEXT,gt); } }
+  if(g_cfCells && !blob.empty()){
+    HGLOBAL gb=GlobalAlloc(GMEM_MOVEABLE,blob.size());
+    if(gb){ void* p=GlobalLock(gb); if(p){ memcpy(p,blob.data(),blob.size()); GlobalUnlock(gb); SetClipboardData(g_cfCells,gb); } }
+  }
   CloseClipboard();
 }
 static void doCopy(){
+  int c0,c1,r0,r1;
   if(g_hasSel){
-    int c0,c1,r0,r1; selBounds(c0,c1,r0,r1);
-    setClipboardText(regionText(c0,c1,r0,r1));
+    selBounds(c0,c1,r0,r1);
+    std::vector<uint8_t> blob; buildBlob(c0,c1,r0,r1,blob);
+    setClipBoth(regionText(c0,c1,r0,r1),blob);
   } else {
-    int c=g_cx; uint32_t v=g_cells[(size_t)g_cy*g_cols+c];
+    int c=g_cx; uint32_t v=g_cells[(size_t)g_cy*g_cols+c]; int w=1;
     if(v==CONT){ c--; v=g_cells[(size_t)g_cy*g_cols+c]; }
+    if(v){ Glyph gl=getGlyph(v); w=(gl.w==2)?2:1; }
+    c0=c; c1=imin(c+w-1,g_cols-1); r0=r1=g_cy;
     std::wstring out; appendCP(out, v?v:L' ');
-    setClipboardText(out);
+    std::vector<uint8_t> blob; buildBlob(c0,c1,r0,r1,blob);
+    setClipBoth(out,blob);
   }
 }
 static RECT doCut(){
@@ -406,13 +439,13 @@ static RECT doCut(){
     if(v){ Glyph gl=getGlyph(v); w=(gl.w==2)?2:1; }
     c0=c; c1=c+w-1; r0=r1=g_cy;
     if(c1>g_cols-1) c1=g_cols-1;
-    if(!v){ std::wstring o; appendCP(o,L' '); setClipboardText(o); return emptyRectPx(); } // 空格：只复制不删
+    if(!v){ std::wstring o; appendCP(o,L' '); std::vector<uint8_t> bl; buildBlob(c0,c1,r0,r1,bl); setClipBoth(o,bl); return emptyRectPx(); } // 空格：只复制不删
   }
-  setClipboardText(regionText(c0,c1,r0,r1));
+  { std::vector<uint8_t> bl; buildBlob(c0,c1,r0,r1,bl); setClipBoth(regionText(c0,c1,r0,r1),bl); }
   truncateFuture();
   Op op; op.type=OP_TEXT; op.r0=r0; op.c0=c0; op.rows=r1-r0+1; op.cols=c1-c0+1;
   snapBefore(op);
-  for(int r=r0;r<=r1;r++) for(int c=c0;c<=c1;c++) g_cells[(size_t)r*g_cols+c]=0;
+  for(int r=r0;r<=r1;r++) for(int c=c0;c<=c1;c++){ g_cells[(size_t)r*g_cols+c]=0; g_cellColor[(size_t)r*g_cols+c]=0; }
   snapAfter(op);
   op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=c0; op.cby1=r0;
   pushOp(op);
@@ -421,7 +454,45 @@ static RECT doCut(){
   g_dirty=true;
   return rowsRectPx(r0,r1);
 }
+static RECT pasteBlob(int rows,int cols,const uint32_t* cp,const uint32_t* co){
+  int r0=g_cy, c0=g_cx;
+  int pr=imin(rows,g_H-r0); if(pr<=0) return emptyRectPx();
+  int pc=imin(cols,g_cols-c0); if(pc<=0) return emptyRectPx();
+  truncateFuture();
+  Op op; op.type=OP_TEXT; op.r0=r0; op.c0=c0; op.rows=pr; op.cols=pc;
+  snapBefore(op);
+  for(int r=0;r<pr;r++) for(int c=0;c<pc;c++){
+    uint32_t v=cp[(size_t)r*cols+c];
+    if(v==CONT) continue;
+    int rr=r0+r, cc=c0+c;
+    if(v==0) clearGlyphAt(rr,cc);
+    else putGlyph(rr,cc,v,co[(size_t)r*cols+c]);
+  }
+  snapAfter(op);
+  int caretC=imin(c0+pc,g_cols-1), caretR=imin(r0+pr-1,g_H-1);
+  op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=caretC; op.cby1=caretR;
+  pushOp(op);
+  g_cx=caretC; g_cy=caretR;
+  renderTextRows(r0,r0+pr-1);
+  g_dirty=true;
+  return rowsRectPx(r0,r0+pr-1);
+}
 static RECT doPaste(){
+  if(g_cfCells && IsClipboardFormatAvailable(g_cfCells) && OpenClipboard(g_hwnd)){
+    std::vector<uint8_t> blob;
+    HANDLE h=GetClipboardData(g_cfCells);
+    if(h){ SIZE_T sz=GlobalSize(h); const void* p=GlobalLock(h); if(p){ blob.assign((const uint8_t*)p,(const uint8_t*)p+sz); GlobalUnlock(h);} }
+    CloseClipboard();
+    if(blob.size()>=16){
+      const uint32_t* hh=(const uint32_t*)blob.data();
+      int rows=(int)hh[2], cols=(int)hh[3];
+      if(hh[0]==0x42435854u && hh[1]==1u && rows>0 && cols>0 && blob.size()>=16+(size_t)rows*cols*8){
+        const uint32_t* cp=(const uint32_t*)(blob.data()+16);
+        const uint32_t* co=(const uint32_t*)(blob.data()+16+(size_t)rows*cols*4);
+        return pasteBlob(rows,cols,cp,co);
+      }
+    }
+  }
   if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) return emptyRectPx();
   if(!OpenClipboard(g_hwnd)) return emptyRectPx();
   std::wstring t;
@@ -462,7 +533,7 @@ static RECT doPaste(){
       if(cp<32) continue;           // 控制字符不进画布
       Glyph gl=getGlyph(cp); int w=(gl.bits&&gl.w==2)?2:1;
       if(c+w>g_cols) break;
-      putGlyph(r0+r,c,cp);
+      putGlyph(r0+r,c,cp,textColor());
       c+=w;
     }
   }
@@ -522,7 +593,7 @@ static void rebuildInk(){
 
 // ---------------- 历史时间轴 ----------------
 static void rebuildState(int p){
-  for(size_t i=0;i<g_cells.size();i++) g_cells[i]=g_baseCells[i];
+  for(size_t i=0;i<g_cells.size();i++){ g_cells[i]=g_baseCells[i]; g_cellColor[i]=g_baseCellColor[i]; }
   g_strokes.clear();
   for(int k=0;k<p;k++){
     Op& op=g_ops[k];
@@ -530,7 +601,7 @@ static void rebuildState(int p){
       for(int r=0;r<op.rows;r++)
         for(int c=0;c<op.cols;c++){
           int rr=op.r0+r, cc=op.c0+c;
-          if(rr>=0&&rr<g_H&&cc>=0&&cc<g_cols) g_cells[(size_t)rr*g_cols+cc]=op.after[(size_t)r*op.cols+c];
+          if(rr>=0&&rr<g_H&&cc>=0&&cc<g_cols){ g_cells[(size_t)rr*g_cols+cc]=op.after[(size_t)r*op.cols+c]; g_cellColor[(size_t)rr*g_cols+cc]=op.afterC[(size_t)r*op.cols+c]; }
         }
     } else {
       Stroke s; s.color=op.color; s.size=op.size; s.pts=op.pts; g_strokes.push_back(s);
@@ -677,6 +748,32 @@ static void refreshSize(){
   wchar_t b[16]; swprintf(b,16,L"%d",g_size);
   SetWindowTextW(g_hEditSize,b);
 }
+// 改色时把"当前选区"里的字一并改成该色（一次“写”）
+static void recolorSelection(uint32_t color){
+  int c0,c1,r0,r1;
+  if(g_hasSel){
+    selBounds(c0,c1,r0,r1);
+  } else {                                     // 光标 = 单字选区
+    int c=g_cx; uint32_t v=g_cells[(size_t)g_cy*g_cols+c]; int w=1;
+    if(v==CONT){ c--; v=g_cells[(size_t)g_cy*g_cols+c]; }
+    if(!v) return;                             // 光标没落在字上
+    Glyph gl=getGlyph(v); w=(gl.w==2)?2:1;
+    c0=c; c1=imin(c+w-1,g_cols-1); r0=r1=g_cy;
+  }
+  bool any=false;
+  for(int r=r0;r<=r1&&!any;r++) for(int c=c0;c<=c1;c++){ uint32_t v=g_cells[(size_t)r*g_cols+c]; if(v&&v!=CONT){ any=true; break; } }
+  if(!any) return;
+  truncateFuture();
+  Op op; op.type=OP_TEXT; op.r0=r0; op.c0=c0; op.rows=r1-r0+1; op.cols=c1-c0+1;
+  snapBefore(op);
+  for(int r=r0;r<=r1;r++) for(int c=c0;c<=c1;c++){ uint32_t v=g_cells[(size_t)r*g_cols+c]; if(v&&v!=CONT) g_cellColor[(size_t)r*g_cols+c]=color; }
+  snapAfter(op);
+  op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=g_cx; op.cby1=g_cy;
+  pushOp(op);
+  renderTextRows(r0,r1);
+  g_dirty=true;
+  commitRect(rowsRectPx(r0,r1));
+}
 static void commitColor(){
   wchar_t b[64]; GetWindowTextW(g_hEdit,b,64);
   uint32_t c; if(!parseColor(b,&c)) return;
@@ -690,7 +787,7 @@ static void commitColor(){
       if(g_sw[i].kind==9){ g_sw.erase(g_sw.begin()+i); removed=true; break; }
     if(!removed) break;
   }
-  InvalidateRect(g_hwnd,nullptr,FALSE);
+  recolorSelection(g_brush); invalidateTop();
 }
 static void commitSize(){
   wchar_t b[32]; GetWindowTextW(g_hEditSize,b,32);
@@ -706,7 +803,7 @@ static void clickSwatch(int x,int y){
   g_brush=(g_sw[i].kind==3)?0u:argb(g_sw[i].color);
   g_sw[0].color=g_brush;
   refreshEdit();
-  InvalidateRect(g_hwnd,nullptr,FALSE);
+  recolorSelection(g_brush); invalidateTop();
 }
 static LRESULT CALLBACK EditProc(HWND h,UINT m,WPARAM w,LPARAM l){
   if(m==WM_KEYDOWN && w==VK_RETURN){ if(h==g_hEditSize) commitSize(); else commitColor(); return 0; }
@@ -836,6 +933,7 @@ L"  直接打字：覆盖当前格，光标右移。\r\n"
 L"  方向键：移动光标；Home / End：行首 / 行尾。\r\n"
 L"  Enter：下一行行首；Backspace：删左边一个字。\r\n"
 L"  Ctrl+A：全选；Ctrl+C：复制；Ctrl+X：剪切；Ctrl+V：粘贴（算一次『写』）。\r\n"
+L"  复制/剪切/粘贴会带颜色；从外部程序粘贴则一律用“当前”色。\r\n"
 L"  Ctrl+Z：回撤；Ctrl+Y：重做。\r\n"
 L"  Ctrl+S：保存 PNG；Ctrl+N：新建；Ctrl+L：清空笔迹。\r\n"
 L"\r\n"
@@ -843,6 +941,7 @@ L"【顶栏】\r\n"
 L"  粗：画笔粗细 (1-64)；颜色：当前画笔色 (#RRGGBB)。\r\n"
 L"  色块：当前 / 前景 / 背景 / 透明 / 经典16色 / 历史。\r\n"
 L"  改颜色后追加历史色块，栏满挤掉最旧（前、背景与常用色固定）。\r\n"
+L"  打字与画笔都用“当前”色；每个字记住自己落笔时的颜色（透明=看得见字但无墨）。\r\n"
 L"\r\n"
 L"【底栏】历史时间轴，从左向右生长：写 = 文字，画 = 笔迹；\r\n"
 L"  深色 = 已应用，灰色 = 已回撤；点击切换，满了挤掉最旧。\r\n"
@@ -936,6 +1035,7 @@ static void setupCanvas(int W,int H,uint32_t bg,uint32_t fg){
   g_cols=W*2;
   g_pw=W*16; g_ph=H*16; g_cw=g_pw; g_ch=g_TB+g_ph+g_SB;
   g_cells.assign((size_t)g_H*g_cols,0u);
+  g_cellColor.assign((size_t)g_H*g_cols,0u);
   g_ink.assign((size_t)g_pw*g_ph,0u);
   g_text.assign((size_t)g_pw*g_ph,0u);
   g_fb.assign((size_t)g_pw*g_ph,0u);
@@ -1176,6 +1276,7 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   SetProcessDPIAware();
   GdiplusStartupInput gi; ULONG_PTR tok=0;
   GdiplusStartup(&tok,&gi,nullptr);
+  g_cfCells=RegisterClipboardFormatW(L"texel-cellblock");
 
   loadConfig();
   if(!g_skipNew && !askParams()) return 0;
