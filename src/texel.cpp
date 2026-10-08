@@ -45,8 +45,9 @@ static std::vector<uint32_t> g_fb;
 static uint32_t g_brush = 0xFF000000;
 static int      g_size  = 1;
 static int      g_maxSize = 64;      // 画笔最大粗细 = 画布对角线
-static DWORD    g_wheelT = 0;        // 上次滚轮时间(测速度)
-static int      g_wheelAcc = 0, g_wheelDir = 0;
+static DWORD    g_wheelT = 0;        // 上次滚轮时间
+static double   g_wheelEma = 0.0;    // 平滑后的间隔(EMA)，用于测速
+static double   g_wheelGain = 1024.0;// 滚轮加速封顶(ini: WheelGain)
 static int      g_cx = 0, g_cy = 0;
 static int      g_TB = 24;
 static int      g_SB = 17;
@@ -888,6 +889,7 @@ static void loadConfig(){
   g_hasPos=GetPrivateProfileIntW(L"cfg",L"Pos",0,p)!=0;
   g_skipNew=GetPrivateProfileIntW(L"cfg",L"SkipNew",0,p)!=0;
   g_noSavePrompt=GetPrivateProfileIntW(L"cfg",L"NoSavePrompt",0,p)!=0;
+  { int wg=GetPrivateProfileIntW(L"cfg",L"WheelGain",1024,p); if(wg<1)wg=1; if(wg>4096)wg=4096; g_wheelGain=(double)wg; }
   wchar_t b[16]; uint32_t c;
   GetPrivateProfileStringW(L"cfg",L"Bg",L"FFFFFF",b,16,p); if(parseColor(b,&c)) g_bg=c;
   GetPrivateProfileStringW(L"cfg",L"Fg",L"000000",b,16,p); if(parseColor(b,&c)) g_fg=c;
@@ -932,7 +934,7 @@ L"【鼠标】\r\n"
 L"  左键单击：定位文字光标；点底栏 = 切换历史。\r\n"
 L"  左键长按/拖动：矩形选中，选中区反色显示。\r\n"
 L"  右键拖动：画笔；按住 Shift：八向直线。\r\n"
-L"  滚轮：调整画笔粗细（慢拨 ±1，快拨加速，约 6 步到顶）。\r\n"
+L"  滚轮：调整画笔粗细（慢拨 ±1，拨得越快步进越大）。\r\n"
 L"\r\n"
 L"【键盘】\r\n"
 L"  直接打字：覆盖当前格，光标右移。\r\n"
@@ -944,7 +946,7 @@ L"  Ctrl+Z：回撤；Ctrl+Y：重做。\r\n"
 L"  Ctrl+S：保存 PNG；Ctrl+N：新建；Ctrl+L：清空笔迹。\r\n"
 L"\r\n"
 L"【顶栏】\r\n"
-L"  粗：画笔粗细 1–画布对角线（滚轮慢拨±1、快拨约6步到顶）；颜色：当前画笔色 (#RRGGBB)。\r\n"
+L"  粗：画笔粗细 1–画布对角线（滚轮慢拨±1、越快越大）；颜色：当前画笔色 (#RRGGBB)。\r\n"
 L"  色块：当前 / 前景 / 背景 / 透明 / 经典16色 / 历史。\r\n"
 L"  改颜色后追加历史色块，栏满挤掉最旧（前、背景与常用色固定）。\r\n"
 L"  打字与画笔都用“当前”色；每个字记住自己落笔时的颜色（透明=看得见字但无墨）。\r\n"
@@ -955,6 +957,7 @@ L"\r\n"
 L"【配置 texel.ini（可手动编辑）】\r\n"
 L"  SkipNew=1       启动不弹本窗口，直接用上次参数新建\r\n"
 L"  NoSavePrompt=1  退出不提示保存，直接关闭\r\n"
+L"  WheelGain=1024  滚轮加速封顶(与画布无关；越大越快，慢拨仍±1)\r\n"
 L"  对话框里的『设为默认值』= 保存当前参数 + SkipNew=1\r\n"
 L"\r\n"
 L"  退出时若未保存，会提示保存。\r\n";
@@ -1194,17 +1197,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
     case WM_MOUSEWHEEL:{
       int dz=GET_WHEEL_DELTA_WPARAM(wp);
-      int dir=(dz>0)?1:-1;
       DWORD now=GetTickCount();
-      if(dir==g_wheelDir && (now-g_wheelT)<1000) g_wheelAcc++; else g_wheelAcc=0; // 间隔<1s 才算“连续快滚”
-      const int N=6;                       // 期望：约 N 次快滚到顶（改这个数即可）
-      if(g_wheelAcc>N) g_wheelAcc=N;
-      g_wheelDir=dir; g_wheelT=now;
-      // 按最大值逆推 + 凸曲线(指数P)：低端压住留精细余量，高端更陡
-      double frac=(double)g_wheelAcc/(double)N;                 // 0..1
-      double P=2.0;                                             // 1=几何(现状), 2=更凸, 3=更极端
-      int step = (g_wheelAcc==0) ? 1 : (int)std::pow((double)g_maxSize, std::pow(frac,P));
-      if(step<1) step=1;
+      DWORD dt=now-g_wheelT; g_wheelT=now;            // 距上次滚轮的间隔(ms)
+      if(dt>1000) dt=1000; if(dt<1) dt=1;
+      if(g_wheelEma<=0.0) g_wheelEma=(double)dt; else g_wheelEma=0.6*g_wheelEma+0.4*(double)dt; // 平滑测速
+      const double T_SLOW=250.0, T_FAST=15.0;         // 人类灵敏度边界(ms)
+      double inv=1.0/g_wheelEma, invS=1.0/T_SLOW, invF=1.0/T_FAST;
+      double u=(inv-invS)/(invF-invS); if(u<0)u=0; if(u>1)u=1;   // 速度档 0慢..1极快
+      const double Gm=g_wheelGain;                    // 增益上限(ini: WheelGain，与画布无关)
+      double gain=1.0+(Gm-1.0)*u*u;                   // 死区(=1) + 封顶增益曲线(凸2)
+      int step=(int)(gain+0.5); if(step<1)step=1;
       if(dz>0) g_size+=step; else if(dz<0) g_size-=step;
       if(g_size<1) g_size=1; if(g_size>g_maxSize) g_size=g_maxSize;
       refreshSize();
