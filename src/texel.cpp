@@ -164,11 +164,14 @@ static void decodeCP(const std::wstring& s,std::vector<uint32_t>& out){
 }
 
 // ---------------- 合成 ----------------
-static void renderText(){
+// 只重排指定行范围的文字层（增量）
+static void renderTextRows(int r0,int r1){
+  if(r0<0) r0=0; if(r1>g_H-1) r1=g_H-1;
   uint32_t bgg=argb(g_bg), fgg=argb(g_fg);
-  for(size_t i=0;i<g_text.size();i++) g_text[i]=bgg;
-  for(int y=0;y<g_H;y++){
+  for(int y=r0;y<=r1;y++){
     int by=y*ROWH;
+    for(int r=0;r<ROWH;r++){ int py=by+r; if(py<0||py>=g_ph) continue;
+      uint32_t* p=g_text.data()+(size_t)py*g_pw; for(int x=0;x<g_pw;x++) p[x]=bgg; }
     for(int c=0;c<g_cols;c++){
       uint32_t cp=g_cells[(size_t)y*g_cols+c];
       if(!cp||cp==CONT) continue;
@@ -184,11 +187,66 @@ static void renderText(){
     }
   }
 }
+static void renderText(){ renderTextRows(0,g_H-1); }
 static void compose(){
   memcpy(g_fb.data(), g_text.data(), (size_t)g_pw*g_ph*4);
   uint32_t* ink=g_ink.data(); uint32_t* fb=g_fb.data();
   size_t n=(size_t)g_pw*g_ph;
   for(size_t i=0;i<n;i++){ uint32_t v=ink[i]; if(v>>24) fb[i]=v; }
+}
+
+// ---------------- 脏矩形 + 覆盖层失效 ----------------
+static RECT emptyRectPx(){ RECT r={0,0,-1,-1}; return r; }
+static bool rectEmpty(const RECT& r){ return r.right<r.left||r.bottom<r.top; }
+static void clampPx(RECT& r){
+  if(r.left<0)r.left=0; if(r.top<0)r.top=0;
+  if(r.right>g_pw-1)r.right=g_pw-1; if(r.bottom>g_ph-1)r.bottom=g_ph-1;
+}
+static RECT rowsRectPx(int r0,int r1){ RECT r={0,r0*ROWH,g_pw-1,r1*ROWH+ROWH-1}; return r; }
+static RECT brushRectPx(int x0,int y0,int x1,int y1,int rad){
+  RECT r={imin(x0,x1)-rad,imin(y0,y1)-rad,imax(x0,x1)+rad,imax(y0,y1)+rad}; return r;
+}
+static void invalidatePx(const RECT& r0){
+  RECT r=r0; clampPx(r); if(rectEmpty(r)) return;
+  RECT c={r.left,g_TB+r.top,r.right+1,g_TB+r.bottom+1};
+  InvalidateRect(g_hwnd,&c,FALSE);
+}
+static void recomposePx(const RECT& r0){
+  RECT r=r0; clampPx(r); if(rectEmpty(r)) return;
+  for(int y=r.top;y<=r.bottom;y++){
+    size_t base=(size_t)y*g_pw;
+    uint32_t* fb=g_fb.data()+base; const uint32_t* tx=g_text.data()+base; const uint32_t* ink=g_ink.data()+base;
+    for(int x=r.left;x<=r.right;x++){ uint32_t v=ink[x]; fb[x]=(v>>24)?v:tx[x]; }
+  }
+}
+static void commitRect(const RECT& r){ invalidatePx(r); recomposePx(r); }
+static void redrawAllCanvas(){ RECT r={0,0,g_pw-1,g_ph-1}; commitRect(r); }
+
+static RECT caretRectPx(){
+  int row=g_cy,col=g_cx,w=1;
+  uint32_t cp=g_cells[(size_t)row*g_cols+g_cx];
+  if(cp==CONT){col=g_cx-1;w=2;} else if(cp){Glyph gl=getGlyph(cp);w=(gl.w==2)?2:1;}
+  RECT r={col*COLW,row*ROWH,col*COLW+w*COLW-1,row*ROWH+ROWH-1}; return r;
+}
+static RECT selRectPx(){
+  RECT r=emptyRectPx();
+  if(!g_selecting&&!g_hasSel) return r;
+  int c0,c1,r0,r1; selBounds(c0,c1,r0,r1);
+  r.left=c0*COLW; r.top=r0*ROWH; r.right=(c1+1)*COLW-1; r.bottom=(r1+1)*ROWH-1;
+  return r;
+}
+static void unionR(RECT& a,const RECT& b){
+  if(rectEmpty(b)) return;
+  if(rectEmpty(a)){ a=b; return; }
+  if(b.left<a.left)a.left=b.left; if(b.top<a.top)a.top=b.top;
+  if(b.right>a.right)a.right=b.right; if(b.bottom>a.bottom)a.bottom=b.bottom;
+}
+static RECT overlayRectPx(){ RECT a=selRectPx(); unionR(a,caretRectPx()); return a; }
+static RECT g_prevOverlay={0,0,-1,-1};
+static void overlayChanged(){
+  invalidatePx(g_prevOverlay);
+  g_prevOverlay=overlayRectPx();
+  invalidatePx(g_prevOverlay);
 }
 
 // ---------------- 格子 ----------------
@@ -260,11 +318,11 @@ static void putGlyph(int row,int col,uint32_t cp){
 }
 
 // ---------------- 文字编辑 ----------------
-static void placeChar(uint32_t cp){
-  if(cp<32) return;                 // 控制字符不落格(回车等走光标逻辑)
+static RECT placeChar(uint32_t cp){
+  if(cp<32) return emptyRectPx();   // 控制字符不落格(回车等走光标逻辑)
   Glyph gl=getGlyph(cp);
   int w=(gl.bits&&gl.w==2)?2:1;
-  if(g_cx+w>g_cols) return;
+  if(g_cx+w>g_cols) return emptyRectPx();
   int row=g_cy;
   truncateFuture();
   int start=imax(0,g_cx-1);
@@ -278,9 +336,11 @@ static void placeChar(uint32_t cp){
   snapAfter(op);
   op.cbx0=x0; op.cby0=y0; op.cbx1=g_cx; op.cby1=g_cy;
   pushOp(op);
+  renderTextRows(row,row);
+  return rowsRectPx(row,row);
 }
-static void doBackspace(){
-  if(g_cx<=0) return;
+static RECT doBackspace(){
+  if(g_cx<=0) return emptyRectPx();
   int row=g_cy;
   truncateFuture();
   int x0=g_cx,y0=g_cy;
@@ -294,6 +354,8 @@ static void doBackspace(){
   snapAfter(op);
   op.cbx0=x0; op.cby0=y0; op.cbx1=g_cx; op.cby1=g_cy;
   pushOp(op);
+  renderTextRows(row,row);
+  return rowsRectPx(row,row);
 }
 
 // ---------------- 剪贴板 ----------------
@@ -332,7 +394,7 @@ static void doCopy(){
     setClipboardText(out);
   }
 }
-static void doCut(){
+static RECT doCut(){
   int c0,c1,r0,r1;
   if(g_hasSel){ selBounds(c0,c1,r0,r1); }
   else {
@@ -342,7 +404,7 @@ static void doCut(){
     if(v){ Glyph gl=getGlyph(v); w=(gl.w==2)?2:1; }
     c0=c; c1=c+w-1; r0=r1=g_cy;
     if(c1>g_cols-1) c1=g_cols-1;
-    if(!v){ std::wstring o; appendCP(o,L' '); setClipboardText(o); return; } // 空格：只复制不删
+    if(!v){ std::wstring o; appendCP(o,L' '); setClipboardText(o); return emptyRectPx(); } // 空格：只复制不删
   }
   setClipboardText(regionText(c0,c1,r0,r1));
   truncateFuture();
@@ -353,17 +415,18 @@ static void doCut(){
   op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=c0; op.cby1=r0;
   pushOp(op);
   g_cx=c0; g_cy=r0; g_hasSel=false;
-  renderText(); compose(); g_dirty=true;
-  InvalidateRect(g_hwnd,nullptr,FALSE);
+  renderTextRows(r0,r1);
+  g_dirty=true;
+  return rowsRectPx(r0,r1);
 }
-static void doPaste(){
-  if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) return;
-  if(!OpenClipboard(g_hwnd)) return;
+static RECT doPaste(){
+  if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) return emptyRectPx();
+  if(!OpenClipboard(g_hwnd)) return emptyRectPx();
   std::wstring t;
   HANDLE h=GetClipboardData(CF_UNICODETEXT);
   if(h){ const wchar_t* p=(const wchar_t*)GlobalLock(h); if(p){ t=p; GlobalUnlock(h);} }
   CloseClipboard();
-  if(t.empty()) return;
+  if(t.empty()) return emptyRectPx();
   std::vector<std::wstring> lines;
   for(size_t i=0;i<=t.size();){
     size_t j=t.find_first_of(L"\r\n",i);
@@ -371,9 +434,9 @@ static void doPaste(){
     lines.push_back(t.substr(i,j-i));
     if(t[j]==L'\r'&&j+1<t.size()&&t[j+1]==L'\n') i=j+2; else i=j+1;
   }
-  if(lines.empty()) return;
+  if(lines.empty()) return emptyRectPx();
   int rows=imin((int)lines.size(), g_H-g_cy);
-  if(rows<=0) return;
+  if(rows<=0) return emptyRectPx();
   std::vector<uint32_t> cps;
   int maxcols=0;
   for(int r=0;r<rows;r++){
@@ -384,7 +447,7 @@ static void doPaste(){
   }
   int c0=g_cx, r0=g_cy;
   int cols=imin(maxcols, g_cols-c0);
-  if(cols<=0) return;
+  if(cols<=0) return emptyRectPx();
   truncateFuture();
   Op op; op.type=OP_TEXT; op.r0=r0; op.c0=c0; op.rows=rows; op.cols=cols;
   snapBefore(op);
@@ -407,8 +470,9 @@ static void doPaste(){
   op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=caretC; op.cby1=caretR;
   pushOp(op);
   g_cx=caretC; g_cy=caretR;
-  renderText(); compose(); g_dirty=true;
-  InvalidateRect(g_hwnd,nullptr,FALSE);
+  renderTextRows(r0,r0+rows-1);
+  g_dirty=true;
+  return rowsRectPx(r0,r0+rows-1);
 }
 
 // ---------------- 画笔 ----------------
@@ -478,6 +542,7 @@ static void setPos(int p){
   if(p==g_pos) return;
   g_pos=p; g_hasSel=false; g_selecting=false; rebuildState(g_pos); g_dirty=true;
   InvalidateRect(g_hwnd,nullptr,FALSE);
+  overlayChanged();
 }
 static void doUndo(){ setPos(g_pos-1); }
 
@@ -909,13 +974,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_PAINT:{
       PAINTSTRUCT ps;
       HDC dc=BeginPaint(hwnd,&ps);
-      drawTopBar();
-      for(int y=0;y<g_ph;y++)
-        memcpy(g_memBits+(size_t)(y+g_TB)*g_cw, g_fb.data()+(size_t)y*g_pw, (size_t)g_pw*4);
+      RECT R=ps.rcPaint;
+      drawTopBar();                     // 顶栏/底栏很矮，整体重画即可
       drawStatusBar();
+      int cy0=R.top-g_TB; if(cy0<0)cy0=0;
+      int cy1=R.bottom-1-g_TB; if(cy1>g_ph-1)cy1=g_ph-1;
+      for(int y=cy0;y<=cy1;y++)         // 只拷画布受影响的行
+        memcpy(g_memBits+(size_t)(y+g_TB)*g_cw, g_fb.data()+(size_t)y*g_pw, (size_t)g_pw*4);
       drawSelection();
       if(!caretInSel()) drawCaret();
-      BitBlt(dc,0,0,g_cw,g_ch,g_memDC,0,0,SRCCOPY);
+      g_prevOverlay=overlayRectPx();
+      int w=R.right-R.left, h=R.bottom-R.top;
+      if(w>0&&h>0) BitBlt(dc,R.left,R.top,w,h,g_memDC,R.left,R.top,SRCCOPY);
       EndPaint(hwnd,&ps);
       return 0;
     }
@@ -938,7 +1008,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       g_selAnchorC=col; g_selAnchorR=row;
       g_selC0=g_selC1=col; g_selR0=g_selR1=row;
       SetTimer(hwnd,2,400,nullptr);
-      InvalidateRect(hwnd,nullptr,FALSE);
+      overlayChanged();
       return 0;
     }
     case WM_MOUSEMOVE:{
@@ -946,17 +1016,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       if(g_drawing){
         int cy=y-g_TB;
         Stroke& st=g_strokes.back();
+        int sx=st.pts.back().x, sy=st.pts.back().y;
         if(GetKeyState(VK_SHIFT)&0x8000){
           int ax=st.pts[0].x, ay=st.pts[0].y;
           POINT e=snap8(ax,ay,x,cy);
           st.pts.clear(); st.pts.push_back({ax,ay}); st.pts.push_back(e);
-          rebuildInk();
+          rebuildInk(); redrawAllCanvas();
         } else {
-          lineBuf(g_ink.data(),st.pts.back().x,st.pts.back().y,x,cy,g_size/2,g_brush);
+          lineBuf(g_ink.data(),sx,sy,x,cy,g_size/2,g_brush);
           st.pts.push_back({x,cy});
+          commitRect(brushRectPx(sx,sy,x,cy,g_size/2));
         }
         g_last.x=x; g_last.y=cy;
-        compose(); InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
       }
       if(g_lbtnDown){
@@ -968,7 +1039,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
           int col=x/COLW, row=(y-g_TB)/ROWH;
           col=imin(imax(col,0),g_cols-1); row=imin(imax(row,0),g_H-1);
           g_selC1=col; g_selR1=row;
-          InvalidateRect(hwnd,nullptr,FALSE);
+          overlayChanged();
         }
         return 0;
       }
@@ -980,7 +1051,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(g_selecting){ g_selecting=false; g_hasSel=true; }
         // 单击：光标已在按下时定位，无需再处理
         g_lbtnDown=false;
-        InvalidateRect(hwnd,nullptr,FALSE);
+        overlayChanged();
       }
       return 0;
     }
@@ -999,14 +1070,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       pushOp(op);
       stampBuf(g_ink.data(),x,cy,g_size/2,g_brush);
       g_dirty=true;
-      compose(); InvalidateRect(hwnd,nullptr,FALSE);
+      overlayChanged();
+      commitRect(brushRectPx(x,cy,x,cy,g_size/2));
       return 0;
     }
     case WM_RBUTTONUP:{
       if(g_drawing){
         g_drawing=false; ReleaseCapture();
         if(!g_ops.empty()) g_ops.back().pts=g_strokes.back().pts;
-        InvalidateRect(hwnd,nullptr,FALSE);
       }
       return 0;
     }
@@ -1016,14 +1087,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       int dz=GET_WHEEL_DELTA_WPARAM(wp);
       if(dz>0) g_size++; else if(dz<0) g_size--;
       if(g_size<1) g_size=1; if(g_size>64) g_size=64;
-      refreshSize(); InvalidateRect(hwnd,nullptr,FALSE);
+      refreshSize();
       return 0;
     }
 
     case WM_TIMER:{
       if(wp==2 && g_lbtnDown && !g_selecting){
         g_selecting=true; KillTimer(hwnd,2);
-        InvalidateRect(hwnd,nullptr,FALSE);
+        overlayChanged();
       }
       return 0;
     }
@@ -1036,10 +1107,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(wp=='S'){ doSave(); return 0; }
         if(wp=='N'){ if(g_skipNew || askParams()) setupCanvas(g_W,g_H,g_bg,g_fg); return 0; }
         if(wp=='C'){ doCopy(); return 0; }
-        if(wp=='X'){ doCut(); return 0; }
-        if(wp=='A'){ g_hasSel=true; g_selecting=false; g_selC0=0; g_selC1=g_cols-1; g_selR0=0; g_selR1=g_H-1; InvalidateRect(hwnd,nullptr,FALSE); return 0; }
-        if(wp=='V'){ doPaste(); return 0; }
-        if(wp=='L'){ truncateFuture(); g_ops.clear(); g_pos=0; baseReset(); g_strokes.clear(); g_hasSel=false; rebuildInk(); renderText(); compose(); g_dirty=true; InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+        if(wp=='X'){ RECT r=doCut(); commitRect(r); overlayChanged(); return 0; }
+        if(wp=='A'){ g_hasSel=true; g_selecting=false; g_selC0=0; g_selC1=g_cols-1; g_selR0=0; g_selR1=g_H-1; overlayChanged(); return 0; }
+        if(wp=='V'){ RECT r=doPaste(); commitRect(r); overlayChanged(); return 0; }
+        if(wp=='L'){ truncateFuture(); g_ops.clear(); g_pos=0; baseReset(); g_strokes.clear(); g_hasSel=false; rebuildInk(); renderText(); compose(); g_dirty=true; redrawAllCanvas(); overlayChanged(); return 0; }
       }
       int row=g_cy; bool moved=false;
       switch(wp){
@@ -1056,7 +1127,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         case VK_PRIOR: case VK_NEXT: break;
         default: return DefWindowProc(hwnd,msg,wp,lp);
       }
-      if(moved) InvalidateRect(hwnd,nullptr,FALSE);
+      if(moved) overlayChanged();
       return 0;
     }
     case WM_CHAR:{
@@ -1068,8 +1139,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         cp=0x10000u+(((uint32_t)g_pendingHigh-0xD800u)<<10)+((uint32_t)ch-0xDC00u);
         g_pendingHigh=0;
       } else { g_pendingHigh=0; cp=(uint32_t)ch; }
-      if(cp>=32 && cp!=127){ placeChar(cp); renderText(); compose(); g_dirty=true; InvalidateRect(hwnd,nullptr,FALSE); }
-      else if(cp==8){ doBackspace(); renderText(); compose(); g_dirty=true; InvalidateRect(hwnd,nullptr,FALSE); }
+      if(cp>=32 && cp!=127){ RECT r=placeChar(cp); if(!rectEmpty(r)){ g_dirty=true; commitRect(r); overlayChanged(); } }
+      else if(cp==8){ RECT r=doBackspace(); if(!rectEmpty(r)){ g_dirty=true; commitRect(r); overlayChanged(); } }
       return 0;
     }
 
