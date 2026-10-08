@@ -13,6 +13,7 @@
 #include <windowsx.h>
 #include <gdiplus.h>
 #include <imm.h>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -43,6 +44,9 @@ static std::vector<uint32_t> g_fb;
 
 static uint32_t g_brush = 0xFF000000;
 static int      g_size  = 1;
+static int      g_maxSize = 64;      // 画笔最大粗细 = 画布对角线
+static DWORD    g_wheelT = 0;        // 上次滚轮时间(测速度)
+static int      g_wheelAcc = 0, g_wheelDir = 0;
 static int      g_cx = 0, g_cy = 0;
 static int      g_TB = 24;
 static int      g_SB = 17;
@@ -550,11 +554,13 @@ static RECT doPaste(){
 
 // ---------------- 画笔 ----------------
 static void stampBuf(uint32_t* buf,int cx,int cy,int r,uint32_t col){
-  for(int dy=-r;dy<=r;dy++){
-    int y=cy+dy; if(y<0||y>=g_ph) continue;
-    for(int dx=-r;dx<=r;dx++){
-      if(dx*dx+dy*dy>r*r) continue;
-      int x=cx+dx; if(x<0||x>=g_pw) continue;
+  int y0=cy-r; if(y0<0)y0=0; int y1=cy+r; if(y1>g_ph-1)y1=g_ph-1;
+  int x0=cx-r; if(x0<0)x0=0; int x1=cx+r; if(x1>g_pw-1)x1=g_pw-1;
+  for(int y=y0;y<=y1;y++){
+    int dy=y-cy, dy2=dy*dy;
+    for(int x=x0;x<=x1;x++){
+      int dx=x-cx;
+      if(dx*dx+dy2>r*r) continue;
       buf[(size_t)y*g_pw+x]=col;
     }
   }
@@ -791,7 +797,7 @@ static void commitColor(){
 }
 static void commitSize(){
   wchar_t b[32]; GetWindowTextW(g_hEditSize,b,32);
-  int v=_wtoi(b); if(v<1) v=1; if(v>64) v=64;
+  int v=_wtoi(b); if(v<1) v=1; if(v>g_maxSize) v=g_maxSize;
   g_size=v; refreshSize();
 }
 static void clickSwatch(int x,int y){
@@ -926,7 +932,7 @@ L"【鼠标】\r\n"
 L"  左键单击：定位文字光标；点底栏 = 切换历史。\r\n"
 L"  左键长按/拖动：矩形选中，选中区反色显示。\r\n"
 L"  右键拖动：画笔；按住 Shift：八向直线。\r\n"
-L"  滚轮：调整画笔粗细。\r\n"
+L"  滚轮：调整画笔粗细（慢拨 ±1，快拨加速，约 6 步到顶）。\r\n"
 L"\r\n"
 L"【键盘】\r\n"
 L"  直接打字：覆盖当前格，光标右移。\r\n"
@@ -938,7 +944,7 @@ L"  Ctrl+Z：回撤；Ctrl+Y：重做。\r\n"
 L"  Ctrl+S：保存 PNG；Ctrl+N：新建；Ctrl+L：清空笔迹。\r\n"
 L"\r\n"
 L"【顶栏】\r\n"
-L"  粗：画笔粗细 (1-64)；颜色：当前画笔色 (#RRGGBB)。\r\n"
+L"  粗：画笔粗细 1–画布对角线（滚轮慢拨±1、快拨约6步到顶）；颜色：当前画笔色 (#RRGGBB)。\r\n"
 L"  色块：当前 / 前景 / 背景 / 透明 / 经典16色 / 历史。\r\n"
 L"  改颜色后追加历史色块，栏满挤掉最旧（前、背景与常用色固定）。\r\n"
 L"  打字与画笔都用“当前”色；每个字记住自己落笔时的颜色（透明=看得见字但无墨）。\r\n"
@@ -1040,6 +1046,7 @@ static void setupCanvas(int W,int H,uint32_t bg,uint32_t fg){
   g_text.assign((size_t)g_pw*g_ph,0u);
   g_fb.assign((size_t)g_pw*g_ph,0u);
   g_strokes.clear(); g_ops.clear(); g_pos=0; baseReset();
+  g_maxSize=(int)std::sqrt((double)g_pw*g_pw+(double)g_ph*g_ph)+1;  // 一戳盖满画布
   g_cx=0; g_cy=0; g_size=1; g_brush=argb(fg); g_dirty=false;
   g_hasSel=false; g_selecting=false; g_lbtnDown=false;
   g_sw.clear();
@@ -1187,8 +1194,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
     case WM_MOUSEWHEEL:{
       int dz=GET_WHEEL_DELTA_WPARAM(wp);
-      if(dz>0) g_size++; else if(dz<0) g_size--;
-      if(g_size<1) g_size=1; if(g_size>64) g_size=64;
+      int dir=(dz>0)?1:-1;
+      DWORD now=GetTickCount();
+      if(dir==g_wheelDir && (now-g_wheelT)<1000) g_wheelAcc++; else g_wheelAcc=0; // 间隔<1s 才算“连续快滚”
+      const int N=6;                       // 期望：约 N 次快滚到顶（改这个数即可）
+      if(g_wheelAcc>N) g_wheelAcc=N;
+      g_wheelDir=dir; g_wheelT=now;
+      // 按最大值逆推 + 凸曲线(指数P)：低端压住留精细余量，高端更陡
+      double frac=(double)g_wheelAcc/(double)N;                 // 0..1
+      double P=2.0;                                             // 1=几何(现状), 2=更凸, 3=更极端
+      int step = (g_wheelAcc==0) ? 1 : (int)std::pow((double)g_maxSize, std::pow(frac,P));
+      if(step<1) step=1;
+      if(dz>0) g_size+=step; else if(dz<0) g_size-=step;
+      if(g_size<1) g_size=1; if(g_size>g_maxSize) g_size=g_maxSize;
       refreshSize();
       return 0;
     }
@@ -1319,12 +1337,12 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   g_uiFontSmall=CreateFontW(-12,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
       OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"MS Shell Dlg");
 
-  // 输入框宽度按等宽字体实测：色框留 8 字余量(6位hex+2，避免输入时滚动/看不全)，粗细框留 3 位
+  // 输入框宽度按等宽字体实测：色框留 8 字余量(6位hex+2，避免输入时滚动/看不全)，粗细框留 5 位
   int sizeX,sizeW,colorX,colorW;
   { HDC mdc=CreateCompatibleDC(nullptr); HGDIOBJ of=SelectObject(mdc,g_uiFont);
     SIZE sz; GetTextExtentPoint32W(mdc,L"000000",6,&sz);
     int cw=(sz.cx+5)/6, edge=GetSystemMetrics(SM_CXEDGE);   // cw=单字符宽
-    sizeW =cw*3+edge*2+6;
+    sizeW =cw*5+edge*2+6;   // 最大可达画布对角线(最多5位)
     colorW=cw*8+edge*2+6;
     SelectObject(mdc,of); DeleteDC(mdc); }
   sizeX=40; colorX=sizeX+sizeW+6; g_swatchX0=colorX+colorW+8;
