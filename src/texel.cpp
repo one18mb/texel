@@ -89,7 +89,7 @@ static bool   g_dirty   = false;
 static int    g_winX = 0, g_winY = 0;
 static bool   g_hasPos = false;
 static POINT  g_last = {0,0};
-static int    g_swatchX0 = 166, g_swatchY0 = 5, g_swPitch = 16, g_swSz = 14;
+static int    g_swatchX0 = 130, g_swatchY0 = 5, g_swPitch = 16, g_swSz = 14;
 
 // 选中
 static bool   g_lbtnDown=false, g_selecting=false, g_hasSel=false;
@@ -248,6 +248,7 @@ static void overlayChanged(){
   g_prevOverlay=overlayRectPx();
   invalidatePx(g_prevOverlay);
 }
+static void invalidateStatus(){ RECT c={0,g_TB+g_ph,g_cw,g_ch}; InvalidateRect(g_hwnd,&c,FALSE); }
 
 // ---------------- 格子 ----------------
 static void clearGlyphAt(int row,int col){
@@ -289,6 +290,7 @@ static void pushOp(const Op& op){
   if((int)g_ops.size()>=timelineCap()) dropOldest();
   g_ops.push_back(op);
   g_pos=(int)g_ops.size();
+  invalidateStatus();          // 时间轴变了 -> 底栏需重绘
 }
 
 // ---------------- 文本块快照 ----------------
@@ -1110,7 +1112,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(wp=='X'){ RECT r=doCut(); commitRect(r); overlayChanged(); return 0; }
         if(wp=='A'){ g_hasSel=true; g_selecting=false; g_selC0=0; g_selC1=g_cols-1; g_selR0=0; g_selR1=g_H-1; overlayChanged(); return 0; }
         if(wp=='V'){ RECT r=doPaste(); commitRect(r); overlayChanged(); return 0; }
-        if(wp=='L'){ truncateFuture(); g_ops.clear(); g_pos=0; baseReset(); g_strokes.clear(); g_hasSel=false; rebuildInk(); renderText(); compose(); g_dirty=true; redrawAllCanvas(); overlayChanged(); return 0; }
+        if(wp=='L'){ truncateFuture(); g_ops.clear(); g_pos=0; baseReset(); g_strokes.clear(); g_hasSel=false; rebuildInk(); renderText(); compose(); g_dirty=true; redrawAllCanvas(); overlayChanged(); invalidateStatus(); return 0; }
       }
       int row=g_cy; bool moved=false;
       switch(wp){
@@ -1211,20 +1213,30 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   g_memDC=CreateCompatibleDC(dc);
   ReleaseDC(g_hwnd,dc);
 
-  g_uiFont=CreateFontW(-11,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
-      OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH,L"MS Shell Dlg");
+  g_uiFont=CreateFontW(-12,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
+      OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,FIXED_PITCH,L"Consolas");
   g_uiFontSmall=CreateFontW(-12,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
       OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"MS Shell Dlg");
 
+  // 输入框宽度按等宽字体实测：色框留 8 字余量(6位hex+2，避免输入时滚动/看不全)，粗细框留 3 位
+  int sizeX,sizeW,colorX,colorW;
+  { HDC mdc=CreateCompatibleDC(nullptr); HGDIOBJ of=SelectObject(mdc,g_uiFont);
+    SIZE sz; GetTextExtentPoint32W(mdc,L"000000",6,&sz);
+    int cw=(sz.cx+5)/6, edge=GetSystemMetrics(SM_CXEDGE);   // cw=单字符宽
+    sizeW =cw*3+edge*2+6;
+    colorW=cw*8+edge*2+6;
+    SelectObject(mdc,of); DeleteDC(mdc); }
+  sizeX=40; colorX=sizeX+sizeW+6; g_swatchX0=colorX+colorW+8;
+
   g_hEditSize=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
       WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|ES_NUMBER,
-      40,(g_TB-16)/2,30,16,g_hwnd,(HMENU)IDC_EDITSIZE,hInst,nullptr);
+      sizeX,(g_TB-16)/2,sizeW,16,g_hwnd,(HMENU)IDC_EDITSIZE,hInst,nullptr);
   g_editProc=(WNDPROC)SetWindowLongPtrW(g_hEditSize,GWLP_WNDPROC,(LONG_PTR)EditProc);
   SendMessageW(g_hEditSize,WM_SETFONT,(WPARAM)g_uiFont,TRUE);
 
   g_hEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
       WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
-      74,(g_TB-16)/2,84,16,g_hwnd,(HMENU)IDC_EDITRGB,hInst,nullptr);
+      colorX,(g_TB-16)/2,colorW,16,g_hwnd,(HMENU)IDC_EDITRGB,hInst,nullptr);
   SetWindowLongPtrW(g_hEdit,GWLP_WNDPROC,(LONG_PTR)EditProc);
   SendMessageW(g_hEdit,WM_SETFONT,(WPARAM)g_uiFont,TRUE);
 
