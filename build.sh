@@ -16,7 +16,7 @@ $CXX -std=c++17 -O2 -municode -mwindows \
     -o ../texel.exe \
     -static -static-libgcc -static-libstdc++ \
     -Wl,--gc-sections -s \
-    -lgdiplus -lgdi32 -luser32 -lkernel32 -lole32 -lcomdlg32 -limm32
+    -lgdiplus -lgdi32 -luser32 -lkernel32 -lole32 -lcomdlg32 -limm32 -lshell32
 
 cd ..
 ls -lh texel.exe

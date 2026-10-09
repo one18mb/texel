@@ -13,6 +13,7 @@
 #include <windowsx.h>
 #include <gdiplus.h>
 #include <imm.h>
+#include <shellapi.h>
 #include <cmath>
 #include <cwctype>
 #include <cstdint>
@@ -81,6 +82,11 @@ static UINT g_cfCells=0;                    // 私有剪贴板格式: 带色文�
 static UINT g_cfPNG=0;                      // 剪贴板 "PNG" 格式
 static void writeInkTo(uint32_t* dst,const Op& op);   // 前置声明
 static int  GetEncoderClsid(const WCHAR* mime,CLSID* clsid);
+static void setupCanvas(int W,int H,uint32_t bg,uint32_t fg);
+static void openTexelZipFile(const wchar_t* path);
+static RECT pasteTexelZipFile(const wchar_t* path);
+static std::vector<std::wstring> hdropFiles(HANDLE h);
+static bool endsWithZW(const std::wstring& s,const wchar_t* suf);
 
 struct Sw { uint32_t color; int kind; };
 static std::vector<Sw> g_sw;
@@ -663,6 +669,12 @@ static RECT doPaste(){
       }
     }
   }
+  if(IsClipboardFormatAvailable(CF_HDROP) && OpenClipboard(g_hwnd)){          // 粘贴 .texel.zip 文件 -> 打开
+    std::vector<std::wstring> fs; HANDLE hd=GetClipboardData(CF_HDROP);
+    if(hd) fs=hdropFiles(hd);
+    CloseClipboard();
+    for(auto& p:fs) if(endsWithZW(p,L".texel.zip")) return pasteTexelZipFile(p.c_str());
+  }
   { RECT r=pasteImage(); if(!rectEmpty(r)) return r; }   // 图片(HDROP/PNG/DIB)
   if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) return emptyRectPx();
   if(!OpenClipboard(g_hwnd)) return emptyRectPx();
@@ -1026,23 +1038,243 @@ static int GetEncoderClsid(const WCHAR* mime, CLSID* clsid){
   free(p);
   return ret;
 }
-static bool doSave(){
-  wchar_t path[MAX_PATH]=L"texel.png";
-  OPENFILENAMEW ofn;
-  memset(&ofn,0,sizeof(ofn));
-  ofn.lStructSize=sizeof(ofn);
-  ofn.hwndOwner=g_hwnd;
-  ofn.lpstrFilter=L"PNG (*.png)\0*.png\0All files\0*.*\0";
-  ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
-  ofn.lpstrDefExt=L"png";
-  ofn.Flags=OFN_OVERWRITEPROMPT|OFN_PATHMUSTEXIST|OFN_EXPLORER;
-  if(!GetSaveFileNameW(&ofn)) return false;
+static bool writePNGFile(const wchar_t* path){
   Bitmap bmp(g_pw,g_ph,g_pw*4,PixelFormat32bppARGB,(BYTE*)g_fb.data());
   CLSID clsid;
   if(GetEncoderClsid(L"image/png",&clsid)<0) return false;
-  if(bmp.Save(path,&clsid,nullptr)!=Ok) return false;
+  if(bmp.Save(path,&clsid,nullptr)!=Gdiplus::Ok) return false;
   g_dirty=false;
   return true;
+}
+
+// ---------------- .texel.zip 格式（自写最小 ZIP: 仅 STORED） ----------------
+static uint32_t crc32buf(const uint8_t* p,size_t n){
+  static uint32_t t[256]; static bool in=false;
+  if(!in){ for(uint32_t i=0;i<256;i++){ uint32_t c=i; for(int k=0;k<8;k++) c=(c&1)?(0xEDB88320u^(c>>1)):(c>>1); t[i]=c; } in=true; }
+  uint32_t c=0xFFFFFFFFu; for(size_t i=0;i<n;i++) c=t[(c^p[i])&0xFF]^(c>>8); return c^0xFFFFFFFFu;
+}
+static void put32(std::vector<uint8_t>& v,uint32_t x){ v.push_back(x&0xFF); v.push_back((x>>8)&0xFF); v.push_back((x>>16)&0xFF); v.push_back((x>>24)&0xFF); }
+static void put16(std::vector<uint8_t>& v,uint16_t x){ v.push_back(x&0xFF); v.push_back((x>>8)&0xFF); }
+static uint32_t get32(const uint8_t* p){ return (uint32_t)(p[0]|(p[1]<<8)|(p[2]<<16)|((uint32_t)p[3]<<24)); }
+static uint16_t get16(const uint8_t* p){ return (uint16_t)(p[0]|(p[1]<<8)); }
+struct ZipEntry { std::string name; std::vector<uint8_t> data; };
+static std::vector<uint8_t> zipBuild(const std::vector<ZipEntry>& es){
+  std::vector<uint8_t> out; std::vector<uint32_t> off,crc,sz;
+  for(auto& e:es){
+    off.push_back((uint32_t)out.size());
+    uint32_t c=crc32buf(e.data.data(),e.data.size()); crc.push_back(c); sz.push_back((uint32_t)e.data.size());
+    put32(out,0x04034b50); put16(out,20); put16(out,0); put16(out,0); put16(out,0); put16(out,0);
+    put32(out,c); put32(out,(uint32_t)e.data.size()); put32(out,(uint32_t)e.data.size());
+    put16(out,(uint16_t)e.name.size()); put16(out,0);
+    out.insert(out.end(),e.name.begin(),e.name.end());
+    out.insert(out.end(),e.data.begin(),e.data.end());
+  }
+  uint32_t cdStart=(uint32_t)out.size();
+  for(size_t i=0;i<es.size();i++){
+    put32(out,0x02014b50); put16(out,20); put16(out,20); put16(out,0); put16(out,0); put16(out,0); put16(out,0);
+    put32(out,crc[i]); put32(out,sz[i]); put32(out,sz[i]);
+    put16(out,(uint16_t)es[i].name.size()); put16(out,0); put16(out,0); put16(out,0); put16(out,0); put32(out,0); put32(out,off[i]);
+    out.insert(out.end(),es[i].name.begin(),es[i].name.end());
+  }
+  uint32_t cdSize=(uint32_t)out.size()-cdStart;
+  put32(out,0x06054b50); put16(out,0); put16(out,0); put16(out,(uint16_t)es.size()); put16(out,(uint16_t)es.size());
+  put32(out,cdSize); put32(out,cdStart); put16(out,0);
+  return out;
+}
+static bool zipRead(const std::vector<uint8_t>& z,std::vector<ZipEntry>& es){
+  if(z.size()<22) return false;
+  size_t eocd=(size_t)-1;
+  for(size_t i=z.size()-22;;i--){ if(get32(&z[i])==0x06054b50){ eocd=i; break; } if(i==0) break; }
+  if(eocd==(size_t)-1) return false;
+  uint16_t n=get16(&z[eocd+10]); uint32_t cd=get32(&z[eocd+16]); size_t p=cd;
+  for(uint16_t i=0;i<n;i++){
+    if(p+46>z.size()||get32(&z[p])!=0x02014b50) return false;
+    uint32_t compSize=get32(&z[p+20]);
+    uint16_t nlen=get16(&z[p+28]), elen=get16(&z[p+30]), clen=get16(&z[p+32]);
+    uint32_t lho=get32(&z[p+42]);
+    std::string name((const char*)&z[p+46],nlen);
+    if((size_t)lho+30>z.size()||get32(&z[lho])!=0x04034b50) return false;
+    uint16_t lnlen=get16(&z[lho+26]), lelen=get16(&z[lho+28]);
+    size_t dstart=(size_t)lho+30+lnlen+lelen;
+    if(dstart+compSize>z.size()) return false;
+    ZipEntry e; e.name=name; e.data.assign(z.begin()+dstart,z.begin()+dstart+compSize);
+    es.push_back(e);
+    p+=(size_t)46+nlen+elen+clen;
+  }
+  return true;
+}
+static std::string utf8enc(const std::wstring& w){
+  if(w.empty()) return std::string();
+  int n=WideCharToMultiByte(CP_UTF8,0,w.c_str(),(int)w.size(),nullptr,0,nullptr,nullptr);
+  std::string s(n,0); WideCharToMultiByte(CP_UTF8,0,w.c_str(),(int)w.size(),&s[0],n,nullptr,nullptr); return s;
+}
+static std::wstring utf8dec(const std::string& s){
+  if(s.empty()) return std::wstring();
+  int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
+  std::wstring w(n,0); MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n); return w;
+}
+static bool encodePNG(const uint32_t* argb,int w,int h,std::vector<uint8_t>& out){
+  if(w<=0||h<=0) return false;
+  Bitmap bmp(w,h,w*4,PixelFormat32bppARGB,(BYTE*)argb);
+  IStream* st=nullptr; if(CreateStreamOnHGlobal(nullptr,TRUE,&st)!=S_OK) return false;
+  CLSID cl; bool ok=false;
+  if(GetEncoderClsid(L"image/png",&cl)>=0 && bmp.Save(st,&cl,nullptr)==Gdiplus::Ok){
+    STATSTG ss; memset(&ss,0,sizeof(ss)); st->Stat(&ss,STATFLAG_NONAME); size_t n=(size_t)ss.cbSize.QuadPart;
+    out.resize(n); LARGE_INTEGER z; z.QuadPart=0; st->Seek(z,STREAM_SEEK_SET,nullptr); ULONG rd=0; st->Read(out.data(),(ULONG)n,&rd); ok=true;
+  }
+  st->Release(); return ok;
+}
+static bool decodePNG(const std::vector<uint8_t>& png,std::vector<uint32_t>& out,int& W,int& H){
+  HGLOBAL g=GlobalAlloc(GMEM_MOVEABLE,png.size()); if(!g) return false;
+  void* p=GlobalLock(g); memcpy(p,png.data(),png.size()); GlobalUnlock(g);
+  IStream* st=nullptr; if(CreateStreamOnHGlobal(g,TRUE,&st)!=S_OK){ GlobalFree(g); return false; }
+  Bitmap bmp(st); bool ok=(bmp.GetLastStatus()==Gdiplus::Ok)&&argbFromBitmap(bmp,out,W,H); st->Release(); return ok;
+}
+static bool writeTexelZipFile(const wchar_t* path){
+  std::string txt,col;
+  for(int y=0;y<g_H;y++){
+    std::wstring line,tok;
+    for(int c=0;c<g_cols;c++){
+      uint32_t cp=g_cells[(size_t)y*g_cols+c];
+      if(cp==0||cp==CONT) continue;
+      line.push_back((wchar_t)cp);
+      uint32_t cc=g_cellColor[(size_t)y*g_cols+c];
+      wchar_t tb[32];
+      if((cc>>24)==0) swprintf(tb,32,L"%d:t",c); else swprintf(tb,32,L"%d:%06X",c,(unsigned)(cc&0xFFFFFF));
+      if(!tok.empty()) tok.push_back(L' ');
+      tok+=tb;
+    }
+    line.push_back(L'\n'); tok.push_back(L'\n');
+    txt+=utf8enc(line); col+=utf8enc(tok);
+  }
+  std::vector<uint8_t> png; if(!encodePNG(g_ink.data(),g_pw,g_ph,png)) return false;
+  std::vector<ZipEntry> es;
+  es.push_back({"text.txt", std::vector<uint8_t>(txt.begin(),txt.end())});
+  es.push_back({"txt.color",std::vector<uint8_t>(col.begin(),col.end())});
+  es.push_back({"ink.png",  png});
+  std::vector<uint8_t> zip=zipBuild(es);
+  FILE* f=_wfopen(path,L"wb"); if(!f) return false;
+  fwrite(zip.data(),1,zip.size(),f); fclose(f);
+  g_dirty=false; return true;
+}
+// 统一保存：一个对话框，两种格式，默认 .texel.zip
+static bool saveFile(){
+  wchar_t path[MAX_PATH]=L"untitled.texel.zip";
+  OPENFILENAMEW ofn; memset(&ofn,0,sizeof(ofn)); ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=g_hwnd;
+  ofn.lpstrFilter=L"texel (*.texel.zip)\0*.texel.zip\0PNG (*.png)\0*.png\0";
+  ofn.nFilterIndex=1; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
+  ofn.Flags=OFN_OVERWRITEPROMPT|OFN_PATHMUSTEXIST|OFN_EXPLORER;
+  if(!GetSaveFileNameW(&ofn)) return false;
+  std::wstring p=path, lo=p; for(auto&ch:lo) ch=(wchar_t)towlower(ch);
+  auto ends=[&](const wchar_t* e){ std::wstring es=e; return lo.size()>=es.size()&&lo.compare(lo.size()-es.size(),es.size(),es)==0; };
+  bool wantPng=(ofn.nFilterIndex==2);
+  if(ends(L".png")) wantPng=true; else if(ends(L".zip")) wantPng=false;
+  if(wantPng){ if(!ends(L".png")) p+=L".png"; return writePNGFile(p.c_str()); }
+  if(!ends(L".zip")) p+=L".texel.zip";
+  return writeTexelZipFile(p.c_str());
+}
+static bool readTexelZip(const wchar_t* path,std::vector<uint8_t>& tb,std::vector<uint8_t>& cb,std::vector<uint32_t>& ink,int& iw,int& ih){
+  FILE* f=_wfopen(path,L"rb"); if(!f) return false;
+  fseek(f,0,SEEK_END); long zs=ftell(f); fseek(f,0,SEEK_SET);
+  std::vector<uint8_t> z(zs>0?zs:0); if(zs>0) fread(z.data(),1,zs,f); fclose(f);
+  std::vector<ZipEntry> es; if(!zipRead(z,es)) return false;
+  const std::vector<uint8_t>* png=nullptr; const std::vector<uint8_t>* tbp=nullptr; const std::vector<uint8_t>* cbp=nullptr;
+  for(auto& e:es){ if(e.name=="ink.png") png=&e.data; else if(e.name=="text.txt") tbp=&e.data; else if(e.name=="txt.color") cbp=&e.data; }
+  if(!png) return false;
+  if(!decodePNG(*png,ink,iw,ih)) return false;
+  if(tbp) tb=*tbp; if(cbp) cb=*cbp;
+  return true;
+}
+static void parseTextInto(std::vector<uint32_t>& cells,std::vector<uint32_t>& colors,int stride,int cols,int H,const std::vector<uint8_t>& tb,const std::vector<uint8_t>& cb){
+  if(tb.empty()) return;
+  std::vector<std::string> tl,cl;
+  { std::string s((const char*)tb.data(),tb.size()); size_t i=0; while(i<=s.size()){ size_t j=s.find('\n',i); if(j==std::string::npos){ tl.push_back(s.substr(i)); break;} tl.push_back(s.substr(i,j-i)); i=j+1; } }
+  if(!cb.empty()){ std::string s((const char*)cb.data(),cb.size()); size_t i=0; while(i<=s.size()){ size_t j=s.find('\n',i); if(j==std::string::npos){ cl.push_back(s.substr(i)); break;} cl.push_back(s.substr(i,j-i)); i=j+1; } }
+  for(int y=0;y<H&&y<(int)tl.size();y++){
+    std::wstring w=utf8dec(tl[y]); std::vector<int> tcol; std::vector<uint32_t> tcolor;
+    if(y<(int)cl.size()){ const std::string& line=cl[y]; size_t i2=0;
+      while(i2<line.size()){ while(i2<line.size()&&line[i2]==' ')i2++; if(i2>=line.size())break;
+        size_t j2=line.find(' ',i2); std::string t=line.substr(i2,j2==std::string::npos?std::string::npos:j2-i2); i2=(j2==std::string::npos)?line.size():j2+1;
+        size_t k=t.find(':'); if(k==std::string::npos)continue;
+        tcol.push_back(atoi(t.substr(0,k).c_str()));
+        std::string cs=t.substr(k+1); uint32_t ccc=0xFF000000u;
+        if(cs!="t"){ unsigned v=0; sscanf(cs.c_str(),"%x",&v); ccc=0xFF000000u|(v&0xFFFFFFu); }
+        tcolor.push_back(ccc); } }
+    int cur=0;
+    for(size_t ci=0;ci<w.size();ci++){
+      uint32_t cp=w[ci]; Glyph gl=getGlyph(cp); int wd=(gl.bits&&gl.w==2)?2:1;
+      int c=(ci<tcol.size())?tcol[ci]:cur;
+      uint32_t ccc=(ci<tcolor.size())?tcolor[ci]:argb(g_fg);
+      if(c>=0&&c<cols){ cells[(size_t)y*stride+c]=cp; if(wd==2&&c+1<cols) cells[(size_t)y*stride+c+1]=CONT; colors[(size_t)y*stride+c]=ccc; }
+      cur=c+wd;
+    }
+  }
+}
+static void openTexelZipFile(const wchar_t* path){
+  std::vector<uint8_t> tb,cb; std::vector<uint32_t> ink; int iw=0,ih=0;
+  if(!readTexelZip(path,tb,cb,ink,iw,ih)) return;
+  if(iw%COLW||ih%ROWH) return;
+  int cols=iw/COLW, W=cols/2, H=ih/ROWH;
+  if(W<4||H<1||W>512||H>512) return;
+  g_bg=0x00FFFFFF; g_fg=0x000000;
+  setupCanvas(W,H,g_bg,g_fg);
+  if((int)ink.size()==g_pw*g_ph) g_ink=ink;
+  parseTextInto(g_cells,g_cellColor,g_cols,g_cols,H,tb,cb);
+  g_baseCells=g_cells; g_baseCellColor=g_cellColor; g_baseInk=g_ink;
+  g_ops.clear(); g_pos=0; g_strokes.clear();
+  renderText(); compose(); g_dirty=false;
+  InvalidateRect(g_hwnd,nullptr,FALSE); overlayChanged();
+}
+// 把 .texel.zip 内容“贴”进当前画布（拖动/粘贴用）
+static RECT pasteTexelZipFile(const wchar_t* path){
+  std::vector<uint8_t> tb,cb; std::vector<uint32_t> ink; int iw=0,ih=0;
+  if(!readTexelZip(path,tb,cb,ink,iw,ih)) return emptyRectPx();
+  if(iw%COLW||ih%ROWH) return emptyRectPx();
+  int scols=iw/COLW, sh=ih/ROWH;
+  std::vector<uint32_t> scells((size_t)sh*scols,0u),scolors((size_t)sh*scols,0u);
+  parseTextInto(scells,scolors,scols,scols,sh,tb,cb);
+  int c0=g_cx, r0=g_cy;
+  int tcols=imin(scols,g_cols-c0); if(tcols<=0) return emptyRectPx();
+  int th=imin(sh,g_H-r0);           if(th<=0) return emptyRectPx();
+  int ix=c0*COLW, iy=r0*ROWH, tiw=imin(iw,g_pw-ix), tih=imin(ih,g_ph-iy);
+  truncateFuture();
+  Op op; op.type=OP_REGION; op.r0=r0; op.c0=c0; op.rows=th; op.cols=imin(tcols+1,g_cols-c0);
+  op.ix=ix; op.iy=iy; op.iw=tiw; op.ih=tih;
+  snapBefore(op); snapInkBefore(op);
+  for(int r=0;r<th;r++) for(int c=0;c<tcols;c++){ uint32_t v=scells[(size_t)r*scols+c]; if(v==0||v==CONT) continue; putGlyph(r0+r,c0+c,v,scolors[(size_t)r*scols+c]); }
+  for(int y=0;y<tih;y++) for(int x=0;x<tiw;x++){ uint32_t a=ink[(size_t)y*iw+x]; if((a>>24)==0) continue; g_ink[(size_t)(iy+y)*g_pw+(ix+x)]=a; }
+  snapAfter(op); snapInkAfter(op);
+  int caretC=imin(c0+tcols,g_cols-1), caretR=r0;
+  op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=caretC; op.cby1=caretR;
+  pushOp(op);
+  g_cx=caretC; g_cy=caretR;
+  renderTextRows(r0,r0+th-1); g_dirty=true;
+  RECT rr={ix,iy,ix+tiw-1,iy+tih-1}; return rr;
+}
+// Ctrl+O：选文件 -> 另起一个 texel 进程打开（不动当前画布）
+static void openZipNewProcess(){
+  wchar_t path[MAX_PATH]=L"";
+  OPENFILENAMEW ofn; memset(&ofn,0,sizeof(ofn)); ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=g_hwnd;
+  ofn.lpstrFilter=L"texel (*.texel.zip)\0*.texel.zip\0All\0*.*\0"; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
+  ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_EXPLORER;
+  if(!GetOpenFileNameW(&ofn)) return;
+  wchar_t exe[MAX_PATH]; if(!GetModuleFileNameW(nullptr,exe,MAX_PATH)) return;
+  std::wstring cmd=L"\""; cmd+=exe; cmd+=L"\" \""; cmd+=path; cmd+=L"\"";
+  STARTUPINFOW si; memset(&si,0,sizeof(si)); si.cb=sizeof(si);
+  PROCESS_INFORMATION pi; memset(&pi,0,sizeof(pi));
+  if(CreateProcessW(nullptr,&cmd[0],nullptr,nullptr,FALSE,0,nullptr,nullptr,&si,&pi)){
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  }
+}
+static std::vector<std::wstring> hdropFiles(HANDLE h){
+  std::vector<std::wstring> v; HDROP dr=(HDROP)h;
+  UINT n=DragQueryFileW(dr,0xFFFFFFFF,nullptr,0);
+  for(UINT i=0;i<n;i++){ wchar_t p[MAX_PATH]; if(DragQueryFileW(dr,i,p,MAX_PATH)) v.push_back(p); }
+  return v;
+}
+static bool endsWithZW(const std::wstring& s,const wchar_t* suf){
+  std::wstring lo=s; for(auto&ch:lo) ch=(wchar_t)towlower(ch);
+  std::wstring e=suf; return lo.size()>=e.size() && lo.compare(lo.size()-e.size(),e.size(),e)==0;
 }
 
 // ---------------- 配置 ----------------
@@ -1133,7 +1365,8 @@ L"  选区含文字与笔迹；复制/剪切/粘贴连颜色与笔迹一起（�
 L"  从外部程序粘贴只有文字，一律用“当前”色。\r\n"
 L"  也可粘贴图片(PNG/BMP/JPG… 或剪贴板图像)：以光标为左上角 1:1 贴上，超出画布忽略。\r\n"
 L"  Ctrl+Z：回撤；Ctrl+Y：重做。\r\n"
-L"  Ctrl+S：保存 PNG；Ctrl+N：新建；Ctrl+L：清空笔迹。\r\n"
+L"  Ctrl+S：保存（PNG / .texel.zip，默认 .texel.zip）；Ctrl+O：新开进程打开 .texel.zip。\r\n"
+L"  Ctrl+N：新建；Ctrl+L：清空笔迹。\r\n"
 L"\r\n"
 L"【顶栏】\r\n"
 L"  粗：画笔粗细 1–画布对角线（滚轮慢拨±1、越快越大）；颜色：当前画笔色 (#RRGGBB)。\r\n"
@@ -1383,6 +1616,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       }
       return 0;
     }
+    case WM_DROPFILES:{
+      std::vector<std::wstring> fs=hdropFiles((HANDLE)wp);
+      RECT r=emptyRectPx();
+      for(auto& p:fs) if(endsWithZW(p,L".texel.zip")){ r=pasteTexelZipFile(p.c_str()); break; }
+      DragFinish((HDROP)wp);
+      commitRect(r); overlayChanged();
+      return 0;
+    }
     case WM_CONTEXTMENU: return 0;
 
     case WM_MOUSEWHEEL:{
@@ -1416,7 +1657,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       if(GetKeyState(VK_CONTROL)&0x8000){
         if(wp=='Z'){ doUndo(); return 0; }
         if(wp=='Y'){ setPos(g_pos+1); return 0; }
-        if(wp=='S'){ doSave(); return 0; }
+        if(wp=='S'){ saveFile(); return 0; }
+        if(wp=='O'){ openZipNewProcess(); return 0; }
         if(wp=='N'){ if(g_skipNew || askParams()) setupCanvas(g_W,g_H,g_bg,g_fg); return 0; }
         if(wp=='C'){ doCopy(); return 0; }
         if(wp=='X'){ RECT r=doCut(); commitRect(r); overlayChanged(); return 0; }
@@ -1465,7 +1707,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       if(g_dirty && !g_noSavePrompt){
         int r=(int)DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_SAVE),hwnd,SaveDlgProc,0);
         if(r==0) return 0;
-        if(r==1){ if(!doSave()) return 0; }
+        if(r==1){ if(!saveFile()) return 0; }
         else if(r==3){
           wchar_t p[MAX_PATH]; configPath(p,MAX_PATH);
           WritePrivateProfileStringW(L"cfg",L"NoSavePrompt",L"1",p);
@@ -1490,7 +1732,9 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   g_cfPNG=RegisterClipboardFormatW(L"PNG");
 
   loadConfig();
-  if(!g_skipNew && !askParams()) return 0;
+  std::wstring startFile;
+  { int ac=0; LPWSTR* av=CommandLineToArgvW(GetCommandLineW(),&ac); if(av){ if(ac>=2) startFile=av[1]; LocalFree(av); } }
+  if(startFile.empty() && !g_skipNew && !askParams()) return 0;
 
   WNDCLASSEXW wc; memset(&wc,0,sizeof(wc));
   wc.cbSize=sizeof(wc);
@@ -1553,8 +1797,10 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   SendMessageW(g_hEdit,WM_SETFONT,(WPARAM)g_uiFont,TRUE);
 
   setupCanvas(g_W,g_H,g_bg,g_fg);
+  if(!startFile.empty()) openTexelZipFile(startFile.c_str());
   placeWindow();
 
+  DragAcceptFiles(g_hwnd,TRUE);
   ShowWindow(g_hwnd,SW_SHOW);
   UpdateWindow(g_hwnd);
   SetFocus(g_hwnd);

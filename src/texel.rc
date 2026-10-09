@@ -31,7 +31,7 @@ STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTI
 CAPTION "字画"
 FONT 9, "MS Shell Dlg"
 BEGIN
-  LTEXT           "尚未保存，是否保存为 PNG？", -1, 12, 12, 196, 24
+  LTEXT           "尚未保存，是否保存为 .texel.zip？", -1, 12, 12, 196, 24
   DEFPUSHBUTTON   "是", IDC_SAVE_YES, 12, 46, 42, 14
   PUSHBUTTON      "否", IDC_SAVE_NO, 58, 46, 42, 14
   PUSHBUTTON      "否，不再提示", IDC_SAVE_NEVER, 104, 46, 66, 14
