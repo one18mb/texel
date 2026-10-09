@@ -1,7 +1,7 @@
 // 字画 texel - 极简像素草稿本
 // 顶栏: 粗细/颜色/色块   画布: 笔迹层(下)+文字层(上)   底栏: 历史时间轴
 // 左键点=定位文字光标, 左键长按/拖动=矩形选中(反色); 右键=画笔(Shift=八向直线)
-// Ctrl+C/V 复制粘贴(粘贴算一次"写"); Ctrl+Z/Y 回撤/重做; Ctrl+S 保存
+// Ctrl+C 复制 / Ctrl+V 粘贴(粘贴算一次"写"); Ctrl+X 只剪文字 / Ctrl+Shift+X 只剪笔迹; Ctrl+Z/Y 回撤/重做; Ctrl+S 保存
 // Unifont 点阵无抗锯齿，半角 8px / 全角 16px
 #ifndef UNICODE
 #define UNICODE
@@ -501,9 +501,9 @@ static std::wstring selText(){
 }
 // 私有格式 v3：'TXCB' + ver + rows + cols + anchorC + anchorR + cp[] + color[] + (iw,ih) + ink[iw*ih]
 // anchorC/anchorR = blob 左上角相对"复制时光标"的偏移；粘贴时 blob 左上角 = 粘贴光标 + anchor
-static void buildBlob(int c0,int c1,int r0,int r1,int anchorC,int anchorR,std::vector<uint8_t>& out){
+static void buildBlob(int c0,int c1,int r0,int r1,int anchorC,int anchorR,std::vector<uint8_t>& out,bool withInk=true){
   int rows=r1-r0+1, cols=c1-c0+1; size_t n=(size_t)rows*cols;
-  int iw=cols*COLW, ih=rows*ROWH; size_t ni=(size_t)iw*ih;
+  int iw=withInk? cols*COLW : 0, ih=withInk? rows*ROWH : 0; size_t ni=(size_t)iw*ih;
   out.assign(24+n*8+8+ni*4,0);
   uint32_t* h=(uint32_t*)out.data(); h[0]=0x42435854u; h[1]=3u; h[2]=(uint32_t)rows; h[3]=(uint32_t)cols; h[4]=(uint32_t)anchorC; h[5]=(uint32_t)anchorR;
   uint32_t* cp=(uint32_t*)(out.data()+24);
@@ -515,7 +515,7 @@ static void buildBlob(int c0,int c1,int r0,int r1,int anchorC,int anchorR,std::v
     cp[(size_t)r*cols+c]= ok? g_cells[(size_t)rr*g_cols+cc] : 0;
     co[(size_t)r*cols+c]= ok? g_cellColor[(size_t)rr*g_cols+cc] : 0;
   }
-  for(int y=0;y<ih;y++) for(int x=0;x<iw;x++){
+  if(withInk) for(int y=0;y<ih;y++) for(int x=0;x<iw;x++){
     int px=c0*COLW+x, py=r0*ROWH+y;
     bool ok=(px<g_pw&&py<g_ph) && selGet(px/COLW, py/ROWH);
     ink[(size_t)y*iw+x]= ok? g_ink[(size_t)py*g_pw+px] : 0;
@@ -561,6 +561,52 @@ static void setClipAll(const std::wstring& text,const std::vector<uint8_t>& blob
   }
   CloseClipboard();
 }
+// 只写文字（CF_UNICODETEXT + 私有块，无图像）
+static void setClipTextOnly(const std::wstring& text,const std::vector<uint8_t>& blob){
+  if(!OpenClipboard(g_hwnd)) return;
+  EmptyClipboard();
+  { size_t tb=(text.size()+1)*sizeof(wchar_t); HGLOBAL gt=GlobalAlloc(GMEM_MOVEABLE,tb);
+    if(gt){ void* p=GlobalLock(gt); if(p){ memcpy(p,text.c_str(),tb); GlobalUnlock(gt); SetClipboardData(CF_UNICODETEXT,gt); } } }
+  if(g_cfCells && !blob.empty()){ HGLOBAL gb=GlobalAlloc(GMEM_MOVEABLE,blob.size());
+    if(gb){ void* p=GlobalLock(gb); if(p){ memcpy(p,blob.data(),blob.size()); GlobalUnlock(gb); SetClipboardData(g_cfCells,gb); } } }
+  CloseClipboard();
+}
+// 只写笔迹（私有块[文字清零] + DIB/PNG 图像，无文字）
+static void setClipInkOnly(int c0,int c1,int r0,int r1){
+  int rw=(c1-c0+1)*COLW, rh=(r1-r0+1)*ROWH, x0=c0*COLW, y0=r0*ROWH;
+  if(rw<=0||rh<=0) return;
+  std::vector<uint32_t> region((size_t)rw*rh,0);
+  for(int y=0;y<rh;y++){ int py=y0+y; if(py>=g_ph) continue;
+    for(int x=0;x<rw;x++){ int px=x0+x; if(px>=g_pw) break;
+      if(selGet(px/COLW,py/ROWH)) region[(size_t)y*rw+x]=g_ink[(size_t)py*g_pw+px]; } }
+  std::vector<uint8_t> blob; buildBlob(c0,c1,r0,r1,c0-g_cx,r0-g_cy,blob,true);
+  if(blob.size()>=24){                                 // 私有块：清空码点/颜色，只保留笔迹
+    uint32_t* hh=(uint32_t*)blob.data();
+    if(hh[0]==0x42435854u){ int rows=(int)hh[2], cols=(int)hh[3]; size_t n=(size_t)rows*cols;
+      uint32_t* cp=(uint32_t*)(blob.data()+24); uint32_t* co=(uint32_t*)(blob.data()+24+n*4);
+      for(size_t i=0;i<n;i++){ cp[i]=0; co[i]=0; } }
+  }
+  if(!OpenClipboard(g_hwnd)) return;
+  EmptyClipboard();
+  if(g_cfCells && !blob.empty()){ HGLOBAL gb=GlobalAlloc(GMEM_MOVEABLE,blob.size());
+    if(gb){ void* p=GlobalLock(gb); if(p){ memcpy(p,blob.data(),blob.size()); GlobalUnlock(gb); SetClipboardData(g_cfCells,gb); } } }
+  { size_t pix=(size_t)rw*rh*4, total=sizeof(BITMAPINFOHEADER)+pix;
+    HGLOBAL gd=GlobalAlloc(GMEM_MOVEABLE,total);
+    if(gd){ BITMAPINFOHEADER* bi=(BITMAPINFOHEADER*)GlobalLock(gd);
+      memset(bi,0,sizeof(BITMAPINFOHEADER)); bi->biSize=sizeof(BITMAPINFOHEADER); bi->biWidth=rw; bi->biHeight=-rh;
+      bi->biPlanes=1; bi->biBitCount=32; bi->biCompression=BI_RGB; bi->biSizeImage=(DWORD)pix;
+      uint32_t* dst=(uint32_t*)((BYTE*)bi+sizeof(BITMAPINFOHEADER));
+      for(int i=0;i<rw*rh;i++) dst[i]=over(0xFFFFFFFFu,region[(size_t)i]);
+      GlobalUnlock(gd); SetClipboardData(CF_DIB,gd); } }
+  if(g_cfPNG){ Bitmap bmp(rw,rh,rw*4,PixelFormat32bppARGB,(BYTE*)region.data());
+    IStream* st=nullptr; if(CreateStreamOnHGlobal(nullptr,TRUE,&st)==S_OK){
+      CLSID cl; if(GetEncoderClsid(L"image/png",&cl)>=0 && bmp.Save(st,&cl,nullptr)==Gdiplus::Ok){
+        STATSTG ss; memset(&ss,0,sizeof(ss)); st->Stat(&ss,STATFLAG_NONAME); size_t n=(size_t)ss.cbSize.QuadPart;
+        HGLOBAL gp=GlobalAlloc(GMEM_MOVEABLE,n);
+        if(gp){ void* p=GlobalLock(gp); LARGE_INTEGER z; z.QuadPart=0; st->Seek(z,STREAM_SEEK_SET,nullptr); ULONG rd=0; st->Read(p,(ULONG)n,&rd); GlobalUnlock(gp); SetClipboardData(g_cfPNG,gp); } }
+      st->Release(); } }
+  CloseClipboard();
+}
 static void doCopy(){
   int c0,c1,r0,r1; selBounds(c0,c1,r0,r1);
   if(c1<c0) return;
@@ -590,6 +636,53 @@ static RECT doCut(){
   g_dirty=true;
   return rowsRectPx(r0,r1);
 }
+// Ctrl+X：剪贴【文字】——复制选区文字到剪贴板，并删除选区文字（不动笔迹）
+static RECT doCutText(){
+  int c0,c1,r0,r1; selBounds(c0,c1,r0,r1);
+  if(c1<c0) return emptyRectPx();
+  bool any=false;
+  for(int r=r0;r<=r1&&!any;r++) for(int c=c0;c<=c1;c++){ if(!selGet(c,r)) continue; uint32_t v=g_cells[(size_t)r*g_cols+c]; if(v&&v!=CONT){ any=true; break; } }
+  if(!any) return emptyRectPx();
+  std::wstring txt=selText();
+  std::vector<uint8_t> bl; buildBlob(c0,c1,r0,r1,c0-g_cx,r0-g_cy,bl,false);   // 只文字，无墨迹
+  setClipTextOnly(txt, bl);
+  truncateFuture();
+  Op op; op.type=OP_TEXT; op.r0=r0; op.c0=c0; op.rows=r1-r0+1; op.cols=c1-c0+1;
+  snapBefore(op);
+  for(int r=r0;r<=r1;r++) for(int c=c0;c<=c1;c++){ if(!selGet(c,r)) continue; g_cells[(size_t)r*g_cols+c]=0; g_cellColor[(size_t)r*g_cols+c]=0; }
+  snapAfter(op);
+  op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=c0; op.cby1=r0;
+  pushOp(op);
+  g_cx=c0; g_cy=r0; selCaret();
+  renderTextRows(r0,r1);
+  g_dirty=true;
+  return rowsRectPx(r0,r1);
+}
+// Ctrl+Shift+X：剪贴【笔迹】——复制选区笔迹到剪贴板，并删除选区笔迹（不动文字）
+static RECT doCutInk(){
+  int c0,c1,r0,r1; selBounds(c0,c1,r0,r1);
+  if(c1<c0) return emptyRectPx();
+  int x0=c0*COLW, y0=r0*ROWH, w=(c1-c0+1)*COLW, h=(r1-r0+1)*ROWH;
+  bool has=false;
+  for(int y=0;y<h&&!has;y++){ int py=y0+y; if(py>=g_ph) break;
+    for(int x=0;x<w;x++){ int px=x0+x; if(px>=g_pw) break;
+      if(selGet(px/COLW,py/ROWH) && (g_ink[(size_t)py*g_pw+px]>>24)!=0){ has=true; break; } } }
+  if(!has) return emptyRectPx();              // 选区无笔迹：直接返回
+  setClipInkOnly(c0,c1,r0,r1);
+  truncateFuture();
+  Op op; op.type=OP_REGION; op.r0=r0; op.c0=c0; op.rows=r1-r0+1; op.cols=c1-c0+1;
+  op.ix=x0; op.iy=y0; op.iw=w; op.ih=h;
+  snapBefore(op); snapInkBefore(op);
+  for(int y=0;y<h;y++){ int py=y0+y; if(py>=g_ph) break;
+    for(int x=0;x<w;x++){ int px=x0+x; if(px>=g_pw) break;
+      if(selGet(px/COLW,py/ROWH)) g_ink[(size_t)py*g_pw+px]=0; } }
+  snapAfter(op); snapInkAfter(op);
+  op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=c0; op.cby1=r0;
+  pushOp(op);
+  g_cx=c0; g_cy=r0; selCaret();
+  g_dirty=true;
+  return rowsRectPx(r0,r1);
+}
 static RECT pasteBlob(int rows,int cols,const uint32_t* cp,const uint32_t* co,int iw,int ih,const uint32_t* ink,int anchorC=0,int anchorR=0){
   (void)ih;                                        // 高度由 rows 保证，不再直接使用
   int c0=g_cx+anchorC, r0=g_cy+anchorR;
@@ -609,7 +702,7 @@ static RECT pasteBlob(int rows,int cols,const uint32_t* cp,const uint32_t* co,in
     putGlyph(r0+r,c0+c,v,co[(size_t)(rsrc+r)*cols+(csrc+c)]);
   }
   // 墨迹：图章——只贴不透明像素(b)
-  for(int y=0;y<pr*ROWH;y++) for(int x=0;x<pc*COLW;x++){
+  if(ink) for(int y=0;y<pr*ROWH;y++) for(int x=0;x<pc*COLW;x++){
     uint32_t a=ink[(size_t)(rsrc*ROWH+y)*iw+(csrc*COLW+x)];
     if((a>>24)==0) continue;
     int px=c0*COLW+x, py=r0*ROWH+y;
@@ -815,6 +908,7 @@ static RECT doPaste(){
         const uint32_t* ink=(const uint32_t*)(blob.data()+24+n*8+8);
         int ac=(int)hh[4], ar=(int)hh[5];
         if(iw>0&&ihh>0 && blob.size()>=24+n*8+8+(size_t)iw*ihh*4) return pasteBlob(rows,cols,cp,co,iw,ihh,ink,ac,ar);
+        if(iw==0&&ihh==0) return pasteBlob(rows,cols,cp,co,0,0,nullptr,ac,ar);   // 只文字
       }
     }
   }
@@ -1631,8 +1725,8 @@ L"【键盘】\r\n"
 L"  直接打字：覆盖当前格，光标右移。\r\n"
 L"  方向键：移动光标；Home / End：行首 / 行尾。\r\n"
 L"  Enter：下一行行首；Backspace：删左边一个字。\r\n"
-L"  Ctrl+A：全选；Ctrl+C：复制；Ctrl+X：剪切；Ctrl+V：粘贴（算一次『写』）。\r\n"
-L"  选区含文字与笔迹；复制/剪切/粘贴连颜色与笔迹一起（粘贴为图章：透明处不动）。\r\n"
+L"  Ctrl+A：全选；Ctrl+C：复制；Ctrl+X：剪切文字；Ctrl+Shift+X：剪切笔迹；Ctrl+V：粘贴（算一次『写』）。\r\n"
+L"  复制（Ctrl+C）连同文字与笔迹；剪切分开：Ctrl+X 只剪文字、Ctrl+Shift+X 只剪笔迹（粘贴为图章：透明处不动）。\r\n"
 L"  从外部程序粘贴只有文字，一律用“当前”色。\r\n"
 L"  也可粘贴图片(PNG/BMP/JPG… 或剪贴板图像)：以光标为左上角 1:1 贴上，超出画布忽略。\r\n"
 L"  Ctrl+Z：回撤；Ctrl+Y：重做。\r\n"
@@ -2098,7 +2192,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(wp=='Y'){ setPos(g_pos+1); return 0; }
         if(wp=='S'){ saveFile(); return 0; }
         if(wp=='C'){ doCopy(); return 0; }
-        if(wp=='X'){ RECT r=doCut(); commitRect(r); overlayChanged(); return 0; }
+        if(wp=='X'){
+          if(GetKeyState(VK_SHIFT)&0x8000){ RECT r=doCutInk(); commitRect(r); overlayChanged(); return 0; }
+          RECT r=doCutText(); commitRect(r); overlayChanged(); return 0;
+        }
         if(wp=='A'){ selRect(0,g_cols-1,0,g_H-1); overlayChanged(); return 0; }
         if(wp=='V'){ RECT r=doPaste(); commitRect(r); overlayChanged(); return 0; }
       }
@@ -2122,6 +2219,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_CHAR:{
       if(g_setup) return 0;
+      if(GetKeyState(VK_CONTROL)&0x8000) return 0;   // Ctrl(+Shift) 组合由 WM_KEYDOWN 处理，避免 Ctrl+Shift+X 落成字符
       wchar_t ch=(wchar_t)wp;
       uint32_t cp;
       if((uint32_t)ch>=0xD800 && (uint32_t)ch<=0xDBFF){ g_pendingHigh=ch; return 0; }   // 高代理，等低位
