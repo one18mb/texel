@@ -52,7 +52,6 @@
 | Ctrl+V | 粘贴（算一次「写」） |
 | Ctrl+Z / Ctrl+Y | 回撤 / 重做 |
 | Ctrl+S | 保存（PNG 或 `.texel.zip`，默认 `.texel.zip`） |
-| Ctrl+L | 清空笔迹 |
 | PageUp / PageDown | 无绑定 |
 
 > 快捷键仅在画布有焦点时生效；焦点在顶栏输入框时按键归输入框，Esc 可退回画布。

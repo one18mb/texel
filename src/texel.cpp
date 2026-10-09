@@ -1,7 +1,7 @@
 // 字画 texel - 极简像素草稿本
 // 顶栏: 粗细/颜色/色块   画布: 笔迹层(下)+文字层(上)   底栏: 历史时间轴
 // 左键点=定位文字光标, 左键长按/拖动=矩形选中(反色); 右键=画笔(Shift=八向直线)
-// Ctrl+C/V 复制粘贴(粘贴算一次"写"); Ctrl+Z/Y 回撤/重做; Ctrl+S 保存; Ctrl+L 清空
+// Ctrl+C/V 复制粘贴(粘贴算一次"写"); Ctrl+Z/Y 回撤/重做; Ctrl+S 保存
 // Unifont 点阵无抗锯齿，半角 8px / 全角 16px
 #ifndef UNICODE
 #define UNICODE
@@ -54,6 +54,7 @@ static double   g_wheelGain = 1024.0;// 滚轮加速封顶(ini: WheelGain)
 static int      g_cx = 0, g_cy = 0;
 static int      g_TB = 24;
 static int      g_SB = 17;
+static const int STATUS_COORD_W = 64;   // 底栏左下角坐标 y,x + 分隔符 的像素宽度(7字符*8 + '|')
 
 static const uint8_t* g_font = nullptr;
 static uint32_t       g_fontN = 0;
@@ -282,10 +283,12 @@ static void unionR(RECT& a,const RECT& b){
 }
 static RECT overlayRectPx(){ RECT a=selRectPx(); unionR(a,caretRectPx()); return a; }
 static RECT g_prevOverlay={0,0,-1,-1};
+static void invalidateStatus();                      // 前置声明（定义在下方）
 static void overlayChanged(){
   invalidatePx(g_prevOverlay);
   g_prevOverlay=overlayRectPx();
   invalidatePx(g_prevOverlay);
+  invalidateStatus();                                 // 光标动了 -> 底栏坐标同步
 }
 static void invalidateStatus(){ RECT c={0,g_ch-g_SB,g_cw,g_ch}; InvalidateRect(g_hwnd,&c,FALSE); }
 static void invalidateTop(){ RECT c={0,0,g_cw,g_TB}; InvalidateRect(g_hwnd,&c,FALSE); }
@@ -932,12 +935,23 @@ static void drawStatusBar(){
   for(int y=y0;y<g_ch;y++)
     for(int x=0;x<g_cw;x++) g_memBits[(size_t)y*g_cw+x]=0xFFF0F0F0u;
   for(int x=0;x<g_cw;x++) putPx(x,y0,0xFF808080u);
+  // 光标坐标 y,x（各固定 3 位，超出显示 ***）
+  wchar_t sy[4]={L'0',L'0',L'0',0}, sx[4]={L'0',L'0',L'0',0};
+  if(g_cy<1000) swprintf(sy,4,L"%03d",g_cy); else wcscpy(sy,L"***");
+  if(g_cx<1000) swprintf(sx,4,L"%03d",g_cx); else wcscpy(sx,L"***");
+  uint32_t cc=0xFF202020u;
+  int px=0;
+  for(int i=0;i<3;i++){ blitGlyph(sy[i],px,y0+1,cc); px+=8; }
+  blitGlyph(L',',px,y0+1,cc); px+=8;
+  for(int i=0;i<3;i++){ blitGlyph(sx[i],px,y0+1,cc); px+=8; }
+  blitGlyph(L'|',px,y0+1,0xFF808080u); px+=8;
+  // 时间轴（从坐标区右侧开始）
   uint32_t act=0xFF202020u, gray=0xFFB4B4B4u;
-  int n=(int)g_ops.size(); int cap=g_cw/16; if(n>cap) n=cap;
+  int n=(int)g_ops.size(); int cap=(g_cw-px)/16; if(n>cap) n=cap;
   for(int i=0;i<n;i++){
     uint32_t col=(i<g_pos)?act:gray;
     uint32_t cp=(g_ops[i].type==OP_TEXT)?CP_WRITE:CP_DRAW;
-    blitGlyph(cp, i*16, y0+1, col);
+    blitGlyph(cp, px+i*16, y0+1, col);
   }
 }
 static void drawSelection(){
@@ -1593,7 +1607,7 @@ L"  选区含文字与笔迹；复制/剪切/粘贴连颜色与笔迹一起（�
 L"  从外部程序粘贴只有文字，一律用“当前”色。\r\n"
 L"  也可粘贴图片(PNG/BMP/JPG… 或剪贴板图像)：以光标为左上角 1:1 贴上，超出画布忽略。\r\n"
 L"  Ctrl+Z：回撤；Ctrl+Y：重做。\r\n"
-L"  Ctrl+S：保存（PNG / .texel.zip，默认 .texel.zip）；Ctrl+L：清空笔迹。\r\n"
+L"  Ctrl+S：保存（PNG / .texel.zip，默认 .texel.zip）。\r\n"
 L"\r\n"
 L"【顶栏】\r\n"
 L"  粗：画笔粗细 1–画布对角线（滚轮慢拨±1、越快越大）；颜色：当前画笔色 (#RRGGBB)。\r\n"
@@ -1883,7 +1897,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(x>=0 && x<g_cw) clickSwatch(x,y);
         return 0;
       }
-      if(y>=g_ch-g_SB){ if(x>=0&&x<g_cw){ int i=x/16; if(i>=0&&i<(int)g_ops.size()) setPos(i+1);} return 0; }
+      if(y>=g_ch-g_SB){
+        if(x>=0 && x<STATUS_COORD_W){ setPos(0); return 0; }   // 点坐标：操作历史回到初始状态（撤销全部）
+        if(x>=STATUS_COORD_W && x<g_cw){ int i=(x-STATUS_COORD_W)/16; if(i>=0&&i<(int)g_ops.size()) setPos(i+1);} return 0;
+      }
       int cy=y-g_canvasY;
       int col=(x-g_ox)/COLW, row=cy/ROWH;
       col=imin(imax(col,0),g_cols-1); row=imin(imax(row,0),g_H-1);
@@ -2020,7 +2037,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(wp=='X'){ RECT r=doCut(); commitRect(r); overlayChanged(); return 0; }
         if(wp=='A'){ g_hasSel=true; g_selecting=false; g_selC0=0; g_selC1=g_cols-1; g_selR0=0; g_selR1=g_H-1; overlayChanged(); return 0; }
         if(wp=='V'){ RECT r=doPaste(); commitRect(r); overlayChanged(); return 0; }
-        if(wp=='L'){ truncateFuture(); g_ops.clear(); g_pos=0; baseReset(); g_strokes.clear(); g_hasSel=false; rebuildInk(); renderText(); compose(); g_dirty=true; redrawAllCanvas(); overlayChanged(); invalidateStatus(); return 0; }
       }
       int row=g_cy; bool moved=false;
       switch(wp){
