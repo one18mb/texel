@@ -1,7 +1,7 @@
 // 字画 texel - 极简像素草稿本
 // 顶栏: 粗细/颜色/色块   画布: 笔迹层(下)+文字层(上)   底栏: 历史时间轴
 // 左键点=定位文字光标, 左键长按/拖动=矩形选中(反色); 右键=画笔(Shift=八向直线)
-// Ctrl+C/V 复制粘贴(粘贴算一次"写"); Ctrl+Z/Y 回撤/重做; Ctrl+S 保存; Ctrl+N 新建; Ctrl+L 清空
+// Ctrl+C/V 复制粘贴(粘贴算一次"写"); Ctrl+Z/Y 回撤/重做; Ctrl+S 保存; Ctrl+L 清空
 // Unifont 点阵无抗锯齿，半角 8px / 全角 16px
 #ifndef UNICODE
 #define UNICODE
@@ -14,6 +14,7 @@
 #include <gdiplus.h>
 #include <imm.h>
 #include <shellapi.h>
+#include <ole2.h>
 #include <cmath>
 #include <cwctype>
 #include <cstdint>
@@ -80,6 +81,8 @@ static std::vector<uint32_t> g_baseCellColor;// 基础文字的颜色
 static std::vector<uint32_t> g_baseInk;     // 基础笔迹(已栅格化位图)
 static UINT g_cfCells=0;                    // 私有剪贴板格式: 带色文字块
 static UINT g_cfPNG=0;                      // 剪贴板 "PNG" 格式
+static UINT g_cfDragImageBits=0;            // "DragImageBits"（浏览器/Shell 拖图位图）
+static UINT g_cfFileContents=0;             // "FileContents"（Chromium 虚拟文件流）
 static void writeInkTo(uint32_t* dst,const Op& op);   // 前置声明
 static int  GetEncoderClsid(const WCHAR* mime,CLSID* clsid);
 static void setupCanvas(int W,int H,uint32_t bg,uint32_t fg);
@@ -87,6 +90,7 @@ static void openTexelZipFile(const wchar_t* path);
 static RECT pasteTexelZipFile(const wchar_t* path);
 static std::vector<std::wstring> hdropFiles(HANDLE h);
 static bool endsWithZW(const std::wstring& s,const wchar_t* suf);
+static RECT pasteDroppedFile(const wchar_t* p);
 
 struct Sw { uint32_t color; int kind; };
 static std::vector<Sw> g_sw;
@@ -101,7 +105,12 @@ static HWND   g_hwnd = nullptr, g_hEdit = nullptr, g_hEditSize = nullptr;
 static HDC    g_memDC = nullptr;
 static HBITMAP g_memBmp = nullptr, g_memBmpOld = nullptr;
 static uint32_t* g_memBits = nullptr;
-static int    g_cw = 0, g_ch = 0;
+static int    g_cw = 0, g_ch = 0;   // 客户区(呈现)尺寸
+static int    g_ox = 0;              // 画布列左偏移(水平居中)
+static int    g_visW = 0;            // 画布可见宽度(≤窗口宽，防越界)
+static int    g_canvasY = 0, g_visH = 0;  // 画布顶(纵向居中)与可见高度
+static bool   g_setup = false;    // 设置模式(无文件启动时先设置，未新建)
+static int    g_editSizeX=40, g_editSizeW=30, g_colorX=74, g_colorW=48;
 static WNDPROC g_editProc = nullptr;
 static HFONT  g_uiFont = nullptr;
 static HFONT  g_uiFontSmall = nullptr;
@@ -118,7 +127,6 @@ static int    g_selAnchorC=0, g_selAnchorR=0;
 static int    g_selC0=0, g_selC1=0, g_selR0=0, g_selR1=0;
 static POINT  g_pressPt = {0,0};
 static wchar_t g_pendingHigh = 0;   // UTF-16 高代理暂存
-static bool   g_skipNew = false;      // ini: SkipNew
 static bool   g_noSavePrompt = false; // ini: NoSavePrompt
 static const int HELP_X=4, HELP_Y=4, HELP_W=32, HELP_H=16;
 
@@ -239,7 +247,7 @@ static RECT brushRectPx(int x0,int y0,int x1,int y1,int rad){
 }
 static void invalidatePx(const RECT& r0){
   RECT r=r0; clampPx(r); if(rectEmpty(r)) return;
-  RECT c={r.left,g_TB+r.top,r.right+1,g_TB+r.bottom+1};
+  RECT c={r.left+g_ox, g_canvasY+r.top, r.right+1+g_ox, g_canvasY+r.bottom+1};
   InvalidateRect(g_hwnd,&c,FALSE);
 }
 static void recomposePx(const RECT& r0){
@@ -279,7 +287,7 @@ static void overlayChanged(){
   g_prevOverlay=overlayRectPx();
   invalidatePx(g_prevOverlay);
 }
-static void invalidateStatus(){ RECT c={0,g_TB+g_ph,g_cw,g_ch}; InvalidateRect(g_hwnd,&c,FALSE); }
+static void invalidateStatus(){ RECT c={0,g_ch-g_SB,g_cw,g_ch}; InvalidateRect(g_hwnd,&c,FALSE); }
 static void invalidateTop(){ RECT c={0,0,g_cw,g_TB}; InvalidateRect(g_hwnd,&c,FALSE); }
 
 // ---------------- 格子 ----------------
@@ -294,7 +302,7 @@ static void clearGlyphAt(int row,int col){
   if(w==2 && start+1<g_cols){ g_cells[(size_t)row*g_cols+start+1]=0; g_cellColor[(size_t)row*g_cols+start+1]=0; }
 }
 static void truncateFuture(){ if((int)g_ops.size()>g_pos) g_ops.resize(g_pos); }
-static int timelineCap(){ int c=g_cw/16; return c<1?1:c; }
+static int timelineCap(){ int c=g_visW/16; return c<1?1:c; }
 static void baseReset(){
   g_baseCells.assign((size_t)g_H*g_cols,0u);
   g_baseCellColor.assign((size_t)g_H*g_cols,0u);
@@ -583,6 +591,18 @@ static bool argbFromBitmap(Bitmap& bmp,std::vector<uint32_t>& out,int& W,int& H)
     for(int x=0;x<W;x++) out[(size_t)y*W+x]=src[x]; }
   bmp.UnlockBits(&bd); return true;
 }
+static bool dibToARGB(const std::vector<BYTE>& dib,std::vector<uint32_t>& out,int& W,int& H){
+  if(dib.size()<sizeof(BITMAPINFOHEADER)) return false;
+  BITMAPINFO* bi=(BITMAPINFO*)dib.data();
+  DWORD hsz=bi->bmiHeader.biSize;                       // 头部大小(40=DIB,124=DIBV5)
+  if(hsz<sizeof(BITMAPINFOHEADER)||hsz>dib.size()) return false;
+  int bc=bi->bmiHeader.biBitCount; size_t hdr=hsz; if(bc<=8) hdr+=((size_t)1<<bc)*sizeof(RGBQUAD);
+  HDC dc=GetDC(g_hwnd); void* bits=nullptr; HBITMAP hb=CreateDIBSection(dc,bi,DIB_RGB_COLORS,&bits,nullptr,0); ReleaseDC(g_hwnd,dc);
+  if(hb&&bits&&dib.size()>hdr){ memcpy(bits,dib.data()+hdr,dib.size()-hdr); Bitmap bmp(hb,nullptr);
+    bool ok=(bmp.GetLastStatus()==Gdiplus::Ok)&&argbFromBitmap(bmp,out,W,H); DeleteObject(hb); return ok; }
+  if(hb) DeleteObject(hb);
+  return false;
+}
 static bool clipImageARGB(std::vector<uint32_t>& out,int& W,int& H){
   if(IsClipboardFormatAvailable(CF_HDROP) && OpenClipboard(g_hwnd)){       // 1) 文件
     std::wstring path;
@@ -610,20 +630,12 @@ static bool clipImageARGB(std::vector<uint32_t>& out,int& W,int& H){
     std::vector<BYTE> dib; HANDLE h=GetClipboardData(CF_DIB);
     if(h){ SIZE_T sz=GlobalSize(h); const void* p=GlobalLock(h); if(p){ dib.assign((const BYTE*)p,(const BYTE*)p+sz); GlobalUnlock(h);} }
     CloseClipboard();
-    if(dib.size()>=sizeof(BITMAPINFOHEADER)){ BITMAPINFO* bi=(BITMAPINFO*)dib.data();
-      int bc=bi->bmiHeader.biBitCount; size_t hdr=sizeof(BITMAPINFOHEADER); if(bc<=8) hdr+=((size_t)1<<bc)*sizeof(RGBQUAD);
-      HDC dc=GetDC(g_hwnd); void* bits=nullptr; HBITMAP hb=CreateDIBSection(dc,bi,DIB_RGB_COLORS,&bits,nullptr,0); ReleaseDC(g_hwnd,dc);
-      if(hb&&bits&&dib.size()>hdr){ memcpy(bits,dib.data()+hdr,dib.size()-hdr); Bitmap bmp(hb,nullptr);
-        bool ok=(bmp.GetLastStatus()==Gdiplus::Ok)&&argbFromBitmap(bmp,out,W,H); DeleteObject(hb); if(ok) return true; }
-      else if(hb) DeleteObject(hb);
-    }
+    if(dibToARGB(dib,out,W,H)) return true;
   }
   return false;
 }
 // 图片粘贴：光标像素为左上角，1:1 不缩放，超出的忽略
-static RECT pasteImage(){
-  std::vector<uint32_t> img; int W=0,H=0;
-  if(!clipImageARGB(img,W,H)) return emptyRectPx();
+static RECT pasteImageARGB(const std::vector<uint32_t>& img,int W,int H){
   int x0=g_cx*COLW, y0=g_cy*ROWH;
   int cw=(x0+W<=g_pw)? W : (g_pw-x0);
   int ch=(y0+H<=g_ph)? H : (g_ph-y0);
@@ -646,42 +658,22 @@ static RECT pasteImage(){
   g_dirty=true;
   RECT r={x0,y0,x0+cw-1,y0+ch-1}; return r;
 }
-static RECT doPaste(){
-  if(g_cfCells && IsClipboardFormatAvailable(g_cfCells) && OpenClipboard(g_hwnd)){
-    std::vector<uint8_t> blob;
-    HANDLE h=GetClipboardData(g_cfCells);
-    if(h){ SIZE_T sz=GlobalSize(h); const void* p=GlobalLock(h); if(p){ blob.assign((const uint8_t*)p,(const uint8_t*)p+sz); GlobalUnlock(h);} }
-    CloseClipboard();
-    if(blob.size()>=16){
-      const uint32_t* hh=(const uint32_t*)blob.data();
-      int rows=(int)hh[2], cols=(int)hh[3];
-      if(hh[0]==0x42435854u && rows>0 && cols>0){
-        size_t n=(size_t)rows*cols; size_t need1=16+n*8;
-        const uint32_t* cp=(const uint32_t*)(blob.data()+16);
-        const uint32_t* co=(const uint32_t*)(blob.data()+16+n*4);
-        if(hh[1]==1u && blob.size()>=need1) return pasteBlob(rows,cols,cp,co,0,0,nullptr);
-        if(hh[1]==2u && blob.size()>=need1+8){
-          const uint32_t* ihp=(const uint32_t*)(blob.data()+16+n*8);
-          int iw=(int)ihp[0], ihh=(int)ihp[1];
-          const uint32_t* ink=(const uint32_t*)(blob.data()+16+n*8+8);
-          if(iw>0&&ihh>0 && blob.size()>=need1+8+(size_t)iw*ihh*4) return pasteBlob(rows,cols,cp,co,iw,ihh,ink);
-        }
-      }
-    }
-  }
-  if(IsClipboardFormatAvailable(CF_HDROP) && OpenClipboard(g_hwnd)){          // 粘贴 .texel.zip 文件 -> 打开
-    std::vector<std::wstring> fs; HANDLE hd=GetClipboardData(CF_HDROP);
-    if(hd) fs=hdropFiles(hd);
-    CloseClipboard();
-    for(auto& p:fs) if(endsWithZW(p,L".texel.zip")) return pasteTexelZipFile(p.c_str());
-  }
-  { RECT r=pasteImage(); if(!rectEmpty(r)) return r; }   // 图片(HDROP/PNG/DIB)
-  if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) return emptyRectPx();
-  if(!OpenClipboard(g_hwnd)) return emptyRectPx();
-  std::wstring t;
-  HANDLE h=GetClipboardData(CF_UNICODETEXT);
-  if(h){ const wchar_t* p=(const wchar_t*)GlobalLock(h); if(p){ t=p; GlobalUnlock(h);} }
-  CloseClipboard();
+static RECT pasteImage(){
+  std::vector<uint32_t> img; int W=0,H=0;
+  if(!clipImageARGB(img,W,H)) return emptyRectPx();
+  return pasteImageARGB(img,W,H);
+}
+static bool loadImageFileARGB(const wchar_t* path,std::vector<uint32_t>& out,int& W,int& H){
+  Bitmap bmp(path); if(bmp.GetLastStatus()!=Gdiplus::Ok) return false;
+  return argbFromBitmap(bmp,out,W,H);
+}
+static RECT pasteImageFile(const wchar_t* path){
+  std::vector<uint32_t> img; int W=0,H=0;
+  if(!loadImageFileARGB(path,img,W,H)) return emptyRectPx();
+  return pasteImageARGB(img,W,H);
+}
+// 文本粘贴：从若干行文本(已解码 UTF-16)按当前色写入
+static RECT pasteText(const std::wstring& t){
   if(t.empty()) return emptyRectPx();
   std::vector<std::wstring> lines;
   for(size_t i=0;i<=t.size();){
@@ -713,14 +705,14 @@ static RECT doPaste(){
     int c=c0;
     for(size_t k=0;k<cps2.size();k++){
       uint32_t cp=cps2[k];
-      if(cp<32) continue;           // 控制字符不进画布
+      if(cp<32) continue;
       Glyph gl=getGlyph(cp); int w=(gl.bits&&gl.w==2)?2:1;
       if(c+w>g_cols) break;
       putGlyph(r0+r,c,cp,textColor());
       c+=w;
     }
   }
-  int caretC=imin(c0+cols, g_cols-1);   // 粘贴块右下角（右边界）
+  int caretC=imin(c0+cols, g_cols-1);
   int caretR=imin(r0+rows-1, g_H-1);
   snapAfter(op);
   op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=caretC; op.cby1=caretR;
@@ -729,6 +721,77 @@ static RECT doPaste(){
   renderTextRows(r0,r0+rows-1);
   g_dirty=true;
   return rowsRectPx(r0,r0+rows-1);
+}
+static bool readTextFile(const wchar_t* path,std::wstring& out){
+  FILE* f=_wfopen(path,L"rb"); if(!f) return false;
+  std::vector<uint8_t> b; uint8_t buf[4096]; size_t n;
+  while((n=fread(buf,1,sizeof(buf),f))>0) b.insert(b.end(),buf,buf+n);
+  fclose(f);
+  if(b.empty()){ out.clear(); return true; }
+  if(b.size()>=3 && b[0]==0xEF && b[1]==0xBB && b[2]==0xBF){                 // UTF-8 BOM
+    std::string s((const char*)b.data()+3, b.size()-3);
+    int need=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
+    std::wstring w(need,0); MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],need);
+    out.swap(w); return true;
+  }
+  if(b.size()>=2 && b[0]==0xFF && b[1]==0xFE){                                // UTF-16LE BOM
+    size_t m=(b.size()-2)/2; std::wstring w(m,0);
+    memcpy(&w[0],b.data()+2,m*2); out.swap(w); return true;
+  }
+  if(b.size()>=2 && b[0]==0xFE && b[1]==0xFF){                                // UTF-16BE BOM
+    size_t m=(b.size()-2)/2; std::wstring w(m,0);
+    for(size_t i=0;i<m;i++){ w[i]=(wchar_t)(((uint16_t)b[2+i*2]<<8)|b[2+i*2+1]); }
+    out.swap(w); return true;
+  }
+  // 无 BOM：先试 UTF-8，失败退回 ANSI
+  std::string s((const char*)b.data(), b.size());
+  int need=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.c_str(),(int)s.size(),nullptr,0);
+  if(need>0){ std::wstring w(need,0); MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],need); out.swap(w); return true; }
+  int na=MultiByteToWideChar(CP_ACP,0,s.c_str(),(int)s.size(),nullptr,0);
+  std::wstring w(na>0?na:0,0); if(na>0) MultiByteToWideChar(CP_ACP,0,s.c_str(),(int)s.size(),&w[0],na);
+  out.swap(w); return true;
+}
+static RECT pasteTextFile(const wchar_t* path){
+  std::wstring t; if(!readTextFile(path,t)) return emptyRectPx();
+  return pasteText(t);
+}
+static RECT doPaste(){
+  if(g_cfCells && IsClipboardFormatAvailable(g_cfCells) && OpenClipboard(g_hwnd)){
+    std::vector<uint8_t> blob;
+    HANDLE h=GetClipboardData(g_cfCells);
+    if(h){ SIZE_T sz=GlobalSize(h); const void* p=GlobalLock(h); if(p){ blob.assign((const uint8_t*)p,(const uint8_t*)p+sz); GlobalUnlock(h);} }
+    CloseClipboard();
+    if(blob.size()>=16){
+      const uint32_t* hh=(const uint32_t*)blob.data();
+      int rows=(int)hh[2], cols=(int)hh[3];
+      if(hh[0]==0x42435854u && rows>0 && cols>0){
+        size_t n=(size_t)rows*cols; size_t need1=16+n*8;
+        const uint32_t* cp=(const uint32_t*)(blob.data()+16);
+        const uint32_t* co=(const uint32_t*)(blob.data()+16+n*4);
+        if(hh[1]==1u && blob.size()>=need1) return pasteBlob(rows,cols,cp,co,0,0,nullptr);
+        if(hh[1]==2u && blob.size()>=need1+8){
+          const uint32_t* ihp=(const uint32_t*)(blob.data()+16+n*8);
+          int iw=(int)ihp[0], ihh=(int)ihp[1];
+          const uint32_t* ink=(const uint32_t*)(blob.data()+16+n*8+8);
+          if(iw>0&&ihh>0 && blob.size()>=need1+8+(size_t)iw*ihh*4) return pasteBlob(rows,cols,cp,co,iw,ihh,ink);
+        }
+      }
+    }
+  }
+  if(IsClipboardFormatAvailable(CF_HDROP) && OpenClipboard(g_hwnd)){          // 剪贴板里的文件
+    std::vector<std::wstring> fs; HANDLE hd=GetClipboardData(CF_HDROP);
+    if(hd) fs=hdropFiles(hd);
+    CloseClipboard();
+    for(auto& p:fs){ RECT r=pasteDroppedFile(p.c_str()); if(!rectEmpty(r)) return r; }
+  }
+  { RECT r=pasteImage(); if(!rectEmpty(r)) return r; }   // 图片(HDROP/PNG/DIB)
+  if(!IsClipboardFormatAvailable(CF_UNICODETEXT)) return emptyRectPx();
+  if(!OpenClipboard(g_hwnd)) return emptyRectPx();
+  std::wstring t;
+  HANDLE h=GetClipboardData(CF_UNICODETEXT);
+  if(h){ const wchar_t* p=(const wchar_t*)GlobalLock(h); if(p){ t=p; GlobalUnlock(h);} }
+  CloseClipboard();
+  return pasteText(t);
 }
 
 // ---------------- 画笔 ----------------
@@ -865,7 +928,7 @@ static void drawTopBar(){
   }
 }
 static void drawStatusBar(){
-  int y0=g_TB+g_ph;
+  int y0=g_ch-g_SB;
   for(int y=y0;y<g_ch;y++)
     for(int x=0;x<g_cw;x++) g_memBits[(size_t)y*g_cw+x]=0xFFF0F0F0u;
   for(int x=0;x<g_cw;x++) putPx(x,y0,0xFF808080u);
@@ -880,7 +943,7 @@ static void drawStatusBar(){
 static void drawSelection(){
   if(!g_selecting && !g_hasSel) return;
   int c0,c1,r0,r1; selBounds(c0,c1,r0,r1);
-  int x0=c0*COLW, y0=g_TB+r0*ROWH, x1=(c1+1)*COLW, y1=g_TB+(r1+1)*ROWH;
+  int x0=g_ox+c0*COLW, y0=g_canvasY+r0*ROWH, x1=g_ox+(c1+1)*COLW, y1=g_canvasY+(r1+1)*ROWH;
   for(int y=y0;y<y1;y++) for(int x=x0;x<x1;x++) invertPx(x,y);
 }
 static void drawCaret(){
@@ -888,7 +951,7 @@ static void drawCaret(){
   uint32_t cp=g_cells[(size_t)row*g_cols+g_cx];
   if(cp==CONT){ col=g_cx-1; w=2; }
   else if(cp){ Glyph gl=getGlyph(cp); w=(gl.w==2)?2:1; }
-  int bx=col*COLW, by=g_TB+row*ROWH;
+  int bx=g_ox+col*COLW, by=g_canvasY+row*ROWH;
   for(int y=0;y<ROWH;y++) for(int x=0;x<w*COLW;x++) invertPx(bx+x,by+y);
 }
 // 光标是否落在选区内：是则不再单独画（选区即"放大的光标"）
@@ -1014,7 +1077,7 @@ static bool imeComposing(HWND hwnd){
 }
 static void positionIme(HWND hwnd){
   HIMC hImc=ImmGetContext(hwnd); if(!hImc) return;
-  int bx=g_cx*COLW, by=g_TB+g_cy*ROWH;
+  int bx=g_ox+g_cx*COLW, by=g_canvasY+g_cy*ROWH;
   COMPOSITIONFORM cf; memset(&cf,0,sizeof(cf));
   cf.dwStyle=CFS_POINT; cf.ptCurrentPos.x=bx; cf.ptCurrentPos.y=by;
   ImmSetCompositionWindow(hImc,&cf);
@@ -1148,10 +1211,13 @@ static bool writeTexelZipFile(const wchar_t* path){
     txt+=utf8enc(line); col+=utf8enc(tok);
   }
   std::vector<uint8_t> png; if(!encodePNG(g_ink.data(),g_pw,g_ph,png)) return false;
+  wchar_t bb[16]; if((g_bg>>24)==0) wcscpy(bb,L"trans"); else swprintf(bb,16,L"%06X",(unsigned)(g_bg&0xFFFFFF));
+  std::string bgs=utf8enc(bb);
   std::vector<ZipEntry> es;
   es.push_back({"text.txt", std::vector<uint8_t>(txt.begin(),txt.end())});
   es.push_back({"txt.color",std::vector<uint8_t>(col.begin(),col.end())});
   es.push_back({"ink.png",  png});
+  es.push_back({"bg.color", std::vector<uint8_t>(bgs.begin(),bgs.end())});
   std::vector<uint8_t> zip=zipBuild(es);
   FILE* f=_wfopen(path,L"wb"); if(!f) return false;
   fwrite(zip.data(),1,zip.size(),f); fclose(f);
@@ -1173,16 +1239,24 @@ static bool saveFile(){
   if(!ends(L".zip")) p+=L".texel.zip";
   return writeTexelZipFile(p.c_str());
 }
-static bool readTexelZip(const wchar_t* path,std::vector<uint8_t>& tb,std::vector<uint8_t>& cb,std::vector<uint32_t>& ink,int& iw,int& ih){
+static bool readTexelZip(const wchar_t* path,std::vector<uint8_t>& tb,std::vector<uint8_t>& cb,std::vector<uint32_t>& ink,int& iw,int& ih,uint32_t* bg=nullptr){
   FILE* f=_wfopen(path,L"rb"); if(!f) return false;
   fseek(f,0,SEEK_END); long zs=ftell(f); fseek(f,0,SEEK_SET);
   std::vector<uint8_t> z(zs>0?zs:0); if(zs>0) fread(z.data(),1,zs,f); fclose(f);
   std::vector<ZipEntry> es; if(!zipRead(z,es)) return false;
-  const std::vector<uint8_t>* png=nullptr; const std::vector<uint8_t>* tbp=nullptr; const std::vector<uint8_t>* cbp=nullptr;
-  for(auto& e:es){ if(e.name=="ink.png") png=&e.data; else if(e.name=="text.txt") tbp=&e.data; else if(e.name=="txt.color") cbp=&e.data; }
+  const std::vector<uint8_t>* png=nullptr; const std::vector<uint8_t>* tbp=nullptr; const std::vector<uint8_t>* cbp=nullptr; const std::vector<uint8_t>* bgp=nullptr;
+  for(auto& e:es){ if(e.name=="ink.png") png=&e.data; else if(e.name=="text.txt") tbp=&e.data; else if(e.name=="txt.color") cbp=&e.data; else if(e.name=="bg.color") bgp=&e.data; }
   if(!png) return false;
   if(!decodePNG(*png,ink,iw,ih)) return false;
   if(tbp) tb=*tbp; if(cbp) cb=*cbp;
+  if(bg){
+    *bg=0x00FFFFFF;
+    if(bgp && !bgp->empty()){
+      std::wstring s=utf8dec(std::string(bgp->begin(),bgp->end()));
+      std::wstring lo=s; for(auto&ch:lo) ch=(wchar_t)towlower(ch);
+      if(!lo.empty() && lo!=L"trans"){ uint32_t c; if(parseColor(s.c_str(),&c)) *bg=0xFF000000u|c; }
+    }
+  }
   return true;
 }
 static void parseTextInto(std::vector<uint32_t>& cells,std::vector<uint32_t>& colors,int stride,int cols,int H,const std::vector<uint8_t>& tb,const std::vector<uint8_t>& cb){
@@ -1212,11 +1286,12 @@ static void parseTextInto(std::vector<uint32_t>& cells,std::vector<uint32_t>& co
 }
 static void openTexelZipFile(const wchar_t* path){
   std::vector<uint8_t> tb,cb; std::vector<uint32_t> ink; int iw=0,ih=0;
-  if(!readTexelZip(path,tb,cb,ink,iw,ih)) return;
+  uint32_t bg=0x00FFFFFF;
+  if(!readTexelZip(path,tb,cb,ink,iw,ih,&bg)) return;
   if(iw%COLW||ih%ROWH) return;
   int cols=iw/COLW, W=cols/2, H=ih/ROWH;
   if(W<4||H<1||W>512||H>512) return;
-  g_bg=0x00FFFFFF; g_fg=0x000000;
+  g_bg=bg; g_fg=0x000000;
   setupCanvas(W,H,g_bg,g_fg);
   if((int)ink.size()==g_pw*g_ph) g_ink=ink;
   parseTextInto(g_cells,g_cellColor,g_cols,g_cols,H,tb,cb);
@@ -1251,21 +1326,6 @@ static RECT pasteTexelZipFile(const wchar_t* path){
   renderTextRows(r0,r0+th-1); g_dirty=true;
   RECT rr={ix,iy,ix+tiw-1,iy+tih-1}; return rr;
 }
-// Ctrl+O：选文件 -> 另起一个 texel 进程打开（不动当前画布）
-static void openZipNewProcess(){
-  wchar_t path[MAX_PATH]=L"";
-  OPENFILENAMEW ofn; memset(&ofn,0,sizeof(ofn)); ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=g_hwnd;
-  ofn.lpstrFilter=L"texel (*.texel.zip)\0*.texel.zip\0All\0*.*\0"; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
-  ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_EXPLORER;
-  if(!GetOpenFileNameW(&ofn)) return;
-  wchar_t exe[MAX_PATH]; if(!GetModuleFileNameW(nullptr,exe,MAX_PATH)) return;
-  std::wstring cmd=L"\""; cmd+=exe; cmd+=L"\" \""; cmd+=path; cmd+=L"\"";
-  STARTUPINFOW si; memset(&si,0,sizeof(si)); si.cb=sizeof(si);
-  PROCESS_INFORMATION pi; memset(&pi,0,sizeof(pi));
-  if(CreateProcessW(nullptr,&cmd[0],nullptr,nullptr,FALSE,0,nullptr,nullptr,&si,&pi)){
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-  }
-}
 static std::vector<std::wstring> hdropFiles(HANDLE h){
   std::vector<std::wstring> v; HDROP dr=(HDROP)h;
   UINT n=DragQueryFileW(dr,0xFFFFFFFF,nullptr,0);
@@ -1276,6 +1336,184 @@ static bool endsWithZW(const std::wstring& s,const wchar_t* suf){
   std::wstring lo=s; for(auto&ch:lo) ch=(wchar_t)towlower(ch);
   std::wstring e=suf; return lo.size()>=e.size() && lo.compare(lo.size()-e.size(),e.size(),e)==0;
 }
+static bool isImageExtZW(const std::wstring& s){
+  return endsWithZW(s,L".png")||endsWithZW(s,L".bmp")||endsWithZW(s,L".jpg")||endsWithZW(s,L".jpeg")
+      ||endsWithZW(s,L".gif")||endsWithZW(s,L".tif")||endsWithZW(s,L".tiff");
+}
+static bool isTextExtZW(const std::wstring& s){
+  return endsWithZW(s,L".txt")||endsWithZW(s,L".md")||endsWithZW(s,L".markdown")
+      ||endsWithZW(s,L".csv")||endsWithZW(s,L".json")||endsWithZW(s,L".log")||endsWithZW(s,L".xml");
+}
+// 按文件类型分发：.texel.zip / 图片 / 文本 -> 粘贴
+static RECT pasteDroppedFile(const wchar_t* p){
+  if(endsWithZW(p,L".texel.zip")) return pasteTexelZipFile(p);
+  if(isImageExtZW(p)) return pasteImageFile(p);
+  if(isTextExtZW(p)) return pasteTextFile(p);
+  return emptyRectPx();
+}
+
+// ---------------- OLE 拖放(外部软件文本/图像选区拖动) ----------------
+static bool idfHasSupported(IDataObject* pdo){
+  FORMATETC fe; memset(&fe,0,sizeof(fe)); fe.dwAspect=DVASPECT_CONTENT; fe.lindex=-1; fe.tymed=TYMED_HGLOBAL;
+  fe.cfFormat=CF_UNICODETEXT; if(pdo->QueryGetData(&fe)==S_OK) return true;
+  fe.cfFormat=CF_TEXT; if(pdo->QueryGetData(&fe)==S_OK) return true;
+  fe.cfFormat=CF_DIB; if(pdo->QueryGetData(&fe)==S_OK) return true;
+  fe.cfFormat=CF_HDROP; if(pdo->QueryGetData(&fe)==S_OK) return true;
+  if(g_cfPNG){ fe.cfFormat=g_cfPNG; if(pdo->QueryGetData(&fe)==S_OK) return true; }
+  if(g_cfDragImageBits){ fe.cfFormat=g_cfDragImageBits; if(pdo->QueryGetData(&fe)==S_OK) return true; }
+  return false;
+}
+static bool idfReadText(IDataObject* pdo,std::wstring& out){
+  FORMATETC fe; STGMEDIUM med;
+  memset(&fe,0,sizeof(fe)); fe.cfFormat=CF_UNICODETEXT; fe.dwAspect=DVASPECT_CONTENT; fe.lindex=-1; fe.tymed=TYMED_HGLOBAL;
+  memset(&med,0,sizeof(med));
+  if(pdo->GetData(&fe,&med)==S_OK && med.hGlobal){
+    SIZE_T sz=GlobalSize(med.hGlobal); const wchar_t* p=(const wchar_t*)GlobalLock(med.hGlobal);
+    if(p){ size_t n=sz/2; while(n>0 && p[n-1]==0) n--; out.assign(p,p+n); GlobalUnlock(med.hGlobal); }
+    ReleaseStgMedium(&med);
+    if(!out.empty()) return true;
+  }
+  memset(&fe,0,sizeof(fe)); fe.cfFormat=CF_TEXT; fe.dwAspect=DVASPECT_CONTENT; fe.lindex=-1; fe.tymed=TYMED_HGLOBAL;
+  memset(&med,0,sizeof(med));
+  if(pdo->GetData(&fe,&med)==S_OK && med.hGlobal){
+    SIZE_T sz=GlobalSize(med.hGlobal); const char* p=(const char*)GlobalLock(med.hGlobal);
+    if(p){ size_t len=sz; while(len>0 && p[len-1]==0) len--;
+      int n=MultiByteToWideChar(CP_ACP,0,p,(int)len,nullptr,0);
+      if(n>0){ out.assign((size_t)n,0); MultiByteToWideChar(CP_ACP,0,p,(int)len,&out[0],n); }
+      GlobalUnlock(med.hGlobal);
+    }
+    ReleaseStgMedium(&med);
+    return !out.empty();
+  }
+  return false;
+}
+struct SDragImage { SIZE sz; POINT pt; HBITMAP hbmp; COLORREF key; };
+static bool idfReadFiles(IDataObject* pdo,std::vector<std::wstring>& fs){
+  FORMATETC fe; STGMEDIUM med;
+  memset(&fe,0,sizeof(fe)); fe.cfFormat=CF_HDROP; fe.dwAspect=DVASPECT_CONTENT; fe.lindex=-1; fe.tymed=TYMED_HGLOBAL;
+  memset(&med,0,sizeof(med));
+  if(pdo->GetData(&fe,&med)!=S_OK || !med.hGlobal){ ReleaseStgMedium(&med); return false; }
+  fs=hdropFiles(med.hGlobal);
+  ReleaseStgMedium(&med);
+  return !fs.empty();
+}
+static bool idfReadFileContentsImage(IDataObject* pdo,int lindex,std::vector<uint32_t>& out,int& W,int& H){
+  for(int t=0;t<2;t++){
+    FORMATETC fe; STGMEDIUM med;
+    memset(&fe,0,sizeof(fe)); fe.cfFormat=g_cfFileContents; fe.dwAspect=DVASPECT_CONTENT; fe.lindex=lindex;
+    fe.tymed=(t==0)?TYMED_ISTREAM:TYMED_HGLOBAL;
+    memset(&med,0,sizeof(med));
+    if(pdo->GetData(&fe,&med)==S_OK){
+      bool ok=false;
+      if(med.tymed==TYMED_ISTREAM && med.pstm){ Bitmap bmp(med.pstm); ok=(bmp.GetLastStatus()==Gdiplus::Ok)&&argbFromBitmap(bmp,out,W,H); }
+      else if(med.tymed==TYMED_HGLOBAL && med.hGlobal){
+        SIZE_T sz=GlobalSize(med.hGlobal); const void* p=GlobalLock(med.hGlobal);
+        if(p){ std::vector<BYTE> data; data.assign((const BYTE*)p,(const BYTE*)p+sz); GlobalUnlock(med.hGlobal);
+          if(!data.empty()){ HGLOBAL g=GlobalAlloc(GMEM_MOVEABLE,data.size());
+            if(g){ void* q=GlobalLock(g); memcpy(q,data.data(),data.size()); GlobalUnlock(g); IStream* st=nullptr;
+              if(CreateStreamOnHGlobal(g,TRUE,&st)==S_OK){ Bitmap bmp(st); ok=(bmp.GetLastStatus()==Gdiplus::Ok)&&argbFromBitmap(bmp,out,W,H); st->Release(); } else GlobalFree(g); } } }
+      }
+      ReleaseStgMedium(&med);
+      if(ok) return true;
+    }
+  }
+  return false;
+}
+static bool idfReadImageARGB(IDataObject* pdo,std::vector<uint32_t>& out,int& W,int& H){
+  FORMATETC fe; STGMEDIUM med;
+  // 1) CF_DIB / CF_DIBV5（最通用位图，浏览器常给 DIBV5）
+  for(int t=0;t<2;t++){
+    memset(&fe,0,sizeof(fe)); fe.cfFormat=(t==0)?CF_DIB:CF_DIBV5; fe.dwAspect=DVASPECT_CONTENT; fe.lindex=-1; fe.tymed=TYMED_HGLOBAL;
+    memset(&med,0,sizeof(med));
+    if(pdo->GetData(&fe,&med)==S_OK){
+      bool ok=false;
+      if(med.hGlobal){ SIZE_T sz=GlobalSize(med.hGlobal); const void* p=GlobalLock(med.hGlobal);
+        if(p){ std::vector<BYTE> dib((const BYTE*)p,(const BYTE*)p+sz); GlobalUnlock(med.hGlobal); ok=dibToARGB(dib,out,W,H); } }
+      ReleaseStgMedium(&med);
+      if(ok) return true;
+    }
+  }
+  // 2) DragImageBits（浏览器/Shell 拖图：可能是 DIB / JPEG / PNG / SHDRAGIMAGE）
+  if(g_cfDragImageBits){
+    memset(&fe,0,sizeof(fe)); fe.cfFormat=g_cfDragImageBits; fe.dwAspect=DVASPECT_CONTENT; fe.lindex=-1; fe.tymed=TYMED_HGLOBAL;
+    memset(&med,0,sizeof(med));
+    if(pdo->GetData(&fe,&med)==S_OK && med.hGlobal){
+      SIZE_T sz=GlobalSize(med.hGlobal);
+      const BYTE* data=(const BYTE*)GlobalLock(med.hGlobal);
+      bool ok=false;
+      if(data && sz>=4){
+        DWORD head=0; memcpy(&head,data,4);
+        if(head==0x28u || head==0x7Cu){                          // DIB biSize
+          std::vector<BYTE> dib(data,data+sz);
+          ok=dibToARGB(dib,out,W,H);
+        } else if((data[0]==0xFF&&data[1]==0xD8)||(data[0]==0x89&&data[1]==0x50)){ // JPEG/PNG
+          HGLOBAL g=GlobalAlloc(GMEM_MOVEABLE,sz);
+          if(g){ void* p=GlobalLock(g); memcpy(p,data,sz); GlobalUnlock(g); IStream* st=nullptr;
+            if(CreateStreamOnHGlobal(g,TRUE,&st)==S_OK){ Bitmap bmp(st); ok=(bmp.GetLastStatus()==Gdiplus::Ok)&&argbFromBitmap(bmp,out,W,H); st->Release(); } else GlobalFree(g); }
+        } else {                                                 // SHDRAGIMAGE
+          const SDragImage* sdi=(const SDragImage*)data;
+          if(sdi->hbmp){ Bitmap bmp(sdi->hbmp,nullptr); ok=(bmp.GetLastStatus()==Gdiplus::Ok)&&argbFromBitmap(bmp,out,W,H); }
+        }
+      }
+      GlobalUnlock(med.hGlobal);
+      ReleaseStgMedium(&med);
+      if(ok) return true;
+    }
+  }
+  // 3) PNG 数据
+  if(g_cfPNG){
+    memset(&fe,0,sizeof(fe)); fe.cfFormat=g_cfPNG; fe.dwAspect=DVASPECT_CONTENT; fe.lindex=-1; fe.tymed=TYMED_HGLOBAL;
+    memset(&med,0,sizeof(med));
+    if(pdo->GetData(&fe,&med)==S_OK && med.hGlobal){
+      SIZE_T sz=GlobalSize(med.hGlobal); const void* p=GlobalLock(med.hGlobal);
+      if(p){ std::vector<BYTE> data; data.assign((const BYTE*)p,(const BYTE*)p+sz); GlobalUnlock(med.hGlobal);
+        if(!data.empty() && decodePNG(data,out,W,H)){ ReleaseStgMedium(&med); return true; } }
+      ReleaseStgMedium(&med);
+    }
+  }
+  return false;
+}
+class TexelDropTarget : public IDropTarget {
+public:
+  TexelDropTarget():m_ref(1),m_accept(false){}
+  STDMETHOD(QueryInterface)(REFIID riid,void** ppv){
+    if(ppv==nullptr) return E_POINTER;
+    if(riid==IID_IUnknown||riid==IID_IDropTarget){ *ppv=this; AddRef(); return S_OK; }
+    *ppv=nullptr; return E_NOINTERFACE;
+  }
+  STDMETHOD_(ULONG,AddRef)(){ return ++m_ref; }
+  STDMETHOD_(ULONG,Release)(){ ULONG r=--m_ref; if(r==0) delete this; return r; }
+  STDMETHOD(DragEnter)(IDataObject* pdo,DWORD,POINTL,DWORD* pdwEffect){
+    m_accept=(!g_setup && idfHasSupported(pdo));
+    *pdwEffect=m_accept? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    return S_OK;
+  }
+  STDMETHOD(DragOver)(DWORD,POINTL,DWORD* pdwEffect){
+    *pdwEffect=m_accept? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    return S_OK;
+  }
+  STDMETHOD(DragLeave)(){ return S_OK; }
+  STDMETHOD(Drop)(IDataObject* pdo,DWORD,POINTL,DWORD* pdwEffect){
+    *pdwEffect=DROPEFFECT_NONE;
+    if(g_setup) return S_OK;
+    RECT r=emptyRectPx();
+    // 1) 文件优先（CF_HDROP）：.texel.zip / 图片 / 文本；浏览器拖图时 CF_HDROP 里的临时图优先于 URL 文本
+    std::vector<std::wstring> fs;
+    if(idfReadFiles(pdo,fs)){ for(auto& p:fs){ r=pasteDroppedFile(p.c_str()); if(!rectEmpty(r)) break; } }
+    // 2) 虚拟文件图片（FileContents：浏览器拖 <img> 的原始字节）
+    if(rectEmpty(r)){ std::vector<uint32_t> img; int W=0,H=0;
+      for(int i=0;i<4;i++){ if(idfReadFileContentsImage(pdo,i,img,W,H)){ r=pasteImageARGB(img,W,H); break; } } }
+    // 3) 位图（CF_DIB / DragImageBits / PNG）
+    if(rectEmpty(r)){ std::vector<uint32_t> img; int W=0,H=0; if(idfReadImageARGB(pdo,img,W,H)) r=pasteImageARGB(img,W,H); }
+    // 3) 文本
+    if(rectEmpty(r)){ std::wstring t; if(idfReadText(pdo,t)) r=pasteText(t); }
+    if(!rectEmpty(r)){ commitRect(r); overlayChanged(); *pdwEffect=DROPEFFECT_COPY; }
+    return S_OK;
+  }
+private:
+  ULONG m_ref;
+  bool m_accept;
+};
 
 // ---------------- 配置 ----------------
 static void configPath(wchar_t* out,int n){
@@ -1306,7 +1544,6 @@ static void loadConfig(){
   g_winX=GetPrivateProfileIntW(L"cfg",L"X",0,p);
   g_winY=GetPrivateProfileIntW(L"cfg",L"Y",0,p);
   g_hasPos=GetPrivateProfileIntW(L"cfg",L"Pos",0,p)!=0;
-  g_skipNew=GetPrivateProfileIntW(L"cfg",L"SkipNew",0,p)!=0;
   g_noSavePrompt=GetPrivateProfileIntW(L"cfg",L"NoSavePrompt",0,p)!=0;
   { int wg=GetPrivateProfileIntW(L"cfg",L"WheelGain",1024,p); if(wg<1)wg=1; if(wg>4096)wg=4096; g_wheelGain=(double)wg; }
   wchar_t b[16]; uint32_t c;
@@ -1330,23 +1567,14 @@ static void saveConfig(){
   }
 }
 
-static void writeIniDefaults(int W,int H,uint32_t bg,uint32_t fg){
-  wchar_t p[MAX_PATH]; configPath(p,MAX_PATH);
-  wchar_t b[16];
-  swprintf(b,16,L"%d",W); WritePrivateProfileStringW(L"cfg",L"W",b,p);
-  swprintf(b,16,L"%d",H); WritePrivateProfileStringW(L"cfg",L"H",b,p);
-  if((bg>>24)==0) wcscpy(b,L"trans"); else swprintf(b,16,L"%06X",(unsigned)(bg&0xFFFFFF)); WritePrivateProfileStringW(L"cfg",L"Bg",b,p);
-  swprintf(b,16,L"%06X",(unsigned)(fg&0xFFFFFF)); WritePrivateProfileStringW(L"cfg",L"Fg",b,p);
-}
-
-// ---------------- 新建对话框 ----------------
+// ---------------- 帮助 ----------------
 static const wchar_t* HELP_TEXT =
 L"字画 texel —— 极简像素草稿本\r\n"
 L"\r\n"
 L"【画布】\r\n"
-L"  尺寸 = 窗口，锁定不可缩放；单位『字』= 16×16 像素。\r\n"
-L"  背景色 = 画布底色（留空/trans = 透明，导出 PNG 带透明通道；屏幕显示为白），\r\n"
-L"  前景色 = 文字颜色（填 #RRGGBB）。创建后不可改。\r\n"
+L"  窗口始终可缩放；画布尺寸在『新建』时确定后锁定，随窗口居中。\r\n"
+L"  单位『字』= 16×16 像素（半角 8px / 全角 16px）。\r\n"
+L"  背景色 = 画布底色（留空/trans = 透明，导出 PNG 带透明通道；屏幕显示为白）。\r\n"
 L"\r\n"
 L"【图层】笔迹层在下，文字层在上（文字盖住笔迹）。\r\n"
 L"\r\n"
@@ -1365,8 +1593,7 @@ L"  选区含文字与笔迹；复制/剪切/粘贴连颜色与笔迹一起（�
 L"  从外部程序粘贴只有文字，一律用“当前”色。\r\n"
 L"  也可粘贴图片(PNG/BMP/JPG… 或剪贴板图像)：以光标为左上角 1:1 贴上，超出画布忽略。\r\n"
 L"  Ctrl+Z：回撤；Ctrl+Y：重做。\r\n"
-L"  Ctrl+S：保存（PNG / .texel.zip，默认 .texel.zip）；Ctrl+O：新开进程打开 .texel.zip。\r\n"
-L"  Ctrl+N：新建；Ctrl+L：清空笔迹。\r\n"
+L"  Ctrl+S：保存（PNG / .texel.zip，默认 .texel.zip）；Ctrl+L：清空笔迹。\r\n"
 L"\r\n"
 L"【顶栏】\r\n"
 L"  粗：画笔粗细 1–画布对角线（滚轮慢拨±1、越快越大）；颜色：当前画笔色 (#RRGGBB)。\r\n"
@@ -1377,63 +1604,18 @@ L"\r\n"
 L"【底栏】历史时间轴，从左向右生长：写 = 文字，画 = 笔迹；\r\n"
 L"  深色 = 已应用，灰色 = 已回撤；点击切换，满了挤掉最旧。\r\n"
 L"\r\n"
+L"【打开 / 拖放】\r\n"
+L"  直接打开 texel.exe：进入设置模式，填宽/高/背景/前景后点『新建』。\r\n"
+L"  把 .texel.zip 拖到 texel.exe 上：以该文件尺寸新开进程打开。\r\n"
+L"  往画布里拖入文件或从外部程序拖入选区：.texel.zip 打开、图片贴图、文本按当前色写入。\r\n"
+L"\r\n"
 L"【配置 texel.ini（可手动编辑）】\r\n"
-L"  SkipNew=1       启动不弹本窗口，直接用上次参数新建\r\n"
 L"  NoSavePrompt=1  退出不提示保存，直接关闭\r\n"
 L"  WheelGain=1024  滚轮加速封顶(与画布无关；越大越快，慢拨仍±1)\r\n"
-L"  对话框里的『设为默认值』= 保存当前参数 + SkipNew=1\r\n"
 L"\r\n"
 L"  退出时若未保存，会提示保存。\r\n";
-
 static void showHelp(){
   MessageBoxW(g_hwnd,HELP_TEXT,L"字画 · 帮助",MB_OK|MB_ICONINFORMATION);
-}
-
-static INT_PTR CALLBACK NewDlgProc(HWND h,UINT m,WPARAM w,LPARAM){
-  switch(m){
-    case WM_INITDIALOG:{
-      wchar_t b[32];
-      swprintf(b,32,L"%d",g_W); SetDlgItemTextW(h,IDC_W,b);
-      swprintf(b,32,L"%d",g_H); SetDlgItemTextW(h,IDC_H,b);
-      if((g_bg>>24)==0) wcscpy(b,L"trans"); else swprintf(b,32,L"%06X",(unsigned)(g_bg&0xFFFFFF)); SetDlgItemTextW(h,IDC_BG,b);
-      swprintf(b,32,L"%06X",(unsigned)(g_fg&0xFFFFFF)); SetDlgItemTextW(h,IDC_FG,b);
-      SetDlgItemTextW(h,IDC_HELPTEXT,HELP_TEXT);
-      return TRUE;
-    }
-    case WM_COMMAND:
-      if(LOWORD(w)==IDC_SETDEF){
-        wchar_t b[32]; uint32_t bg,fg;
-        GetDlgItemTextW(h,IDC_W,b,32); int W=_wtoi(b);
-        GetDlgItemTextW(h,IDC_H,b,32); int H=_wtoi(b);
-        GetDlgItemTextW(h,IDC_BG,b,32); if(!parseBg(b,&bg)) bg=g_bg;
-        GetDlgItemTextW(h,IDC_FG,b,32); if(!parseColor(b,&fg)) fg=g_fg;
-        if(W<4)W=4; if(W>512)W=512; if(H<1)H=1; if(H>512)H=512;
-        writeIniDefaults(W,H,bg,fg);
-        {
-          wchar_t p[MAX_PATH]; configPath(p,MAX_PATH);
-          WritePrivateProfileStringW(L"cfg",L"SkipNew",L"1",p);   // 不再显示本窗口
-        }
-        MessageBoxW(h,L"已把当前参数设为默认值，并关闭“新建画布”提示（下次启动生效）。",L"字画",MB_OK|MB_ICONINFORMATION);
-        return TRUE;
-      }
-      if(LOWORD(w)==IDOK){
-        wchar_t b[32]; uint32_t c;
-        GetDlgItemTextW(h,IDC_W,b,32); int W=_wtoi(b);
-        GetDlgItemTextW(h,IDC_H,b,32); int H=_wtoi(b);
-        GetDlgItemTextW(h,IDC_BG,b,32); if(!parseBg(b,&c)) c=g_bg;
-        GetDlgItemTextW(h,IDC_FG,b,32); uint32_t f; if(!parseColor(b,&f)) f=g_fg;
-        if(W<4) W=4; if(W>512) W=512;
-        if(H<1) H=1; if(H>512) H=512;
-        g_W=W; g_H=H; g_bg=c; g_fg=f;
-        EndDialog(h,1); return TRUE;
-      }
-      if(LOWORD(w)==IDCANCEL){ EndDialog(h,0); return TRUE; }
-      break;
-  }
-  return FALSE;
-}
-static bool askParams(){
-  return DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_NEW),g_hwnd,NewDlgProc,0)==1;
 }
 
 // 退出保存提示：0=取消(不退出) 1=是 2=否 3=否且不再提示
@@ -1465,7 +1647,7 @@ static void createDIB(){
 static void setupCanvas(int W,int H,uint32_t bg,uint32_t fg){
   g_W=W; g_H=H; g_bg=bg; g_fg=fg;
   g_cols=W*2;
-  g_pw=W*16; g_ph=H*16; g_cw=g_pw; g_ch=g_TB+g_ph+g_SB;
+  g_pw=W*16; g_ph=H*16; g_cw=g_pw; g_ch=g_TB+g_ph+g_SB; g_ox=0; g_visW=g_pw; g_canvasY=g_TB; g_visH=g_ph;
   g_cells.assign((size_t)g_H*g_cols,0u);
   g_cellColor.assign((size_t)g_H*g_cols,0u);
   g_ink.assign((size_t)g_pw*g_ph,0u);
@@ -1483,7 +1665,7 @@ static void setupCanvas(int W,int H,uint32_t bg,uint32_t fg){
   for(int i=0;i<16;i++) g_sw.push_back({argb(EGA16[i]),4});
   createDIB();
   RECT rc={0,0,g_cw,g_ch};
-  AdjustWindowRectEx(&rc, WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX, FALSE, 0);
+  AdjustWindowRectEx(&rc, GetWindowLongW(g_hwnd,GWL_STYLE), FALSE, 0);
   SetWindowPos(g_hwnd,nullptr,0,0,rc.right-rc.left,rc.bottom-rc.top,SWP_NOMOVE|SWP_NOZORDER);
   refreshEdit(); refreshSize();
   renderText(); compose();
@@ -1501,21 +1683,187 @@ static void placeWindow(){
   SetWindowPos(g_hwnd,nullptr,x,y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
 }
 
+// ---------------- 设置模式（无文件启动） ----------------
+static bool g_setupBusy=false;
+static HWND g_hSW=nullptr,g_hSH=nullptr,g_hSBG=nullptr,g_hSFG=nullptr,g_hSOK=nullptr,g_hSOPEN=nullptr;
+enum { IDC_SW=2101, IDC_SH=2102, IDC_SBG=2103, IDC_SFG=2104, IDC_SOK=2105, IDC_SOPEN=2106 };
+static void setupConfirm();
+static void setupLayout();
+static LRESULT CALLBACK SetupEditProc(HWND h,UINT m,WPARAM w,LPARAM l){
+  if(m==WM_KEYDOWN && w==VK_RETURN){ if(g_setup) setupConfirm(); return 0; }
+  if(m==WM_CHAR && w==13) return 0;
+  return CallWindowProc(g_editProc,h,m,w,l);
+}
+static void applyCanvasSize(int W,int H){
+  g_W=W; g_H=H; g_cols=W*2; g_pw=W*16; g_ph=H*16;
+  g_cells.assign((size_t)g_H*g_cols,0u);
+  g_cellColor.assign((size_t)g_H*g_cols,0u);
+  g_ink.assign((size_t)g_pw*g_ph,0u);
+  g_text.assign((size_t)g_pw*g_ph,0u);
+  g_fb.assign((size_t)g_pw*g_ph,0u);
+  g_strokes.clear(); g_ops.clear(); g_pos=0; baseReset();
+  g_maxSize=(int)std::sqrt((double)g_pw*g_pw+(double)g_ph*g_ph)+1;
+  renderText(); compose();
+}
+static void computeLayout(){
+  g_ox=(g_cw-g_pw)/2; if(g_ox<0)g_ox=0;
+  g_visW=g_pw; if(g_ox+g_visW>g_cw) g_visW=g_cw-g_ox; if(g_visW<0)g_visW=0;
+  int aT=g_TB, aB=g_ch-g_SB; if(aB<aT) aB=aT;
+  g_canvasY=aT+(aB-aT-g_ph)/2; if(g_canvasY<aT) g_canvasY=aT;   // 纵向居中
+  g_visH=g_ph; if(g_canvasY+g_visH>aB) g_visH=aB-g_canvasY; if(g_visH<0)g_visH=0;
+}
+static void placeTopEdits(){
+  if(!g_hEditSize||!g_hEdit) return;
+  MoveWindow(g_hEditSize, g_editSizeX, (g_TB-16)/2, g_editSizeW, 16, TRUE);
+  MoveWindow(g_hEdit, g_colorX, (g_TB-16)/2, g_colorW, 16, TRUE);
+}
+static void setFieldTexts(int W,int H){
+  if(g_setupBusy||!g_hSW) return;
+  wchar_t b[16]; swprintf(b,16,L"%d",W); SetWindowTextW(g_hSW,b);
+  swprintf(b,16,L"%d",H); SetWindowTextW(g_hSH,b);
+}
+static void setupApplySize(){
+  if(g_setupBusy) return;
+  g_setupBusy=true;
+  int Wmax=g_cw/16; if(Wmax<4)Wmax=4;                  // 上限 = 当前窗口可容纳的最大值
+  int Hmax=(g_ch-g_TB-g_SB)/16; if(Hmax<1)Hmax=1;
+  wchar_t b[32];
+  GetWindowTextW(g_hSW,b,32); int W=_wtoi(b); if(W<4)W=4; if(W>Wmax)W=Wmax;
+  GetWindowTextW(g_hSH,b,32); int H=_wtoi(b); if(H<1)H=1; if(H>Hmax)H=Hmax;
+  applyCanvasSize(W,H);                       // 只改画布，不改窗口
+  computeLayout();
+  createDIB(); placeTopEdits(); setupLayout();
+  swprintf(b,32,L"%d",W); SetWindowTextW(g_hSW,b);      // 回填实际(已夹)值
+  swprintf(b,32,L"%d",H); SetWindowTextW(g_hSH,b);
+  InvalidateRect(g_hwnd,nullptr,FALSE);
+  g_setupBusy=false;
+}
+static void setupLayout(){
+  if(!g_hSW) return;
+  int cx=g_cw/2, cy=g_ch/2;                 // 悬浮于窗口中央，脱离画布
+  int left=cx-95, top=cy-(4*24+36)/2;
+  MoveWindow(g_hSW, left+66, top+2,  110,20, TRUE);
+  MoveWindow(g_hSH, left+66, top+26, 110,20, TRUE);
+  MoveWindow(g_hSBG,left+66, top+50, 110,20, TRUE);
+  MoveWindow(g_hSFG,left+66, top+74, 110,20, TRUE);
+  MoveWindow(g_hSOPEN, cx-54, top+4*24+6, 50,22, TRUE);
+  MoveWindow(g_hSOK, cx+4, top+4*24+6, 50,22, TRUE);
+}
+static void setupCreateControls(){
+  g_setupBusy=true;
+  DWORD st=WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL;
+  g_hSW =CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",st|ES_NUMBER,0,0,10,10,g_hwnd,(HMENU)IDC_SW,g_hInst,nullptr);
+  g_hSH =CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",st|ES_NUMBER,0,0,10,10,g_hwnd,(HMENU)IDC_SH,g_hInst,nullptr);
+  g_hSBG=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",st,0,0,10,10,g_hwnd,(HMENU)IDC_SBG,g_hInst,nullptr);
+  g_hSFG=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",st,0,0,10,10,g_hwnd,(HMENU)IDC_SFG,g_hInst,nullptr);
+  g_hSOPEN=CreateWindowExW(0,L"BUTTON",L"打开",WS_CHILD|WS_VISIBLE,0,0,10,10,g_hwnd,(HMENU)IDC_SOPEN,g_hInst,nullptr);
+  g_hSOK=CreateWindowExW(0,L"BUTTON",L"新建",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,0,0,10,10,g_hwnd,(HMENU)IDC_SOK,g_hInst,nullptr);
+  HWND es[4]={g_hSW,g_hSH,g_hSBG,g_hSFG};
+  for(int i=0;i<4;i++){ SendMessageW(es[i],WM_SETFONT,(WPARAM)g_uiFont,TRUE); SetWindowLongPtrW(es[i],GWLP_WNDPROC,(LONG_PTR)SetupEditProc); }
+  SendMessageW(g_hSOK,WM_SETFONT,(WPARAM)g_uiFont,TRUE);
+  SendMessageW(g_hSOPEN,WM_SETFONT,(WPARAM)g_uiFont,TRUE);
+  wchar_t b[32];
+  swprintf(b,32,L"%d",g_W); SetWindowTextW(g_hSW,b);
+  swprintf(b,32,L"%d",g_H); SetWindowTextW(g_hSH,b);
+  if((g_bg>>24)==0) wcscpy(b,L"trans"); else swprintf(b,32,L"%06X",(unsigned)(g_bg&0xFFFFFF)); SetWindowTextW(g_hSBG,b);
+  swprintf(b,32,L"%06X",(unsigned)(g_fg&0xFFFFFF)); SetWindowTextW(g_hSFG,b);
+  setupLayout();
+  g_setupBusy=false;
+}
+static void setupOpen(){
+  wchar_t path[MAX_PATH]=L"";
+  OPENFILENAMEW ofn; memset(&ofn,0,sizeof(ofn)); ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=g_hwnd;
+  ofn.lpstrFilter=L"texel (*.texel.zip)\0*.texel.zip\0All\0*.*\0"; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
+  ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_EXPLORER;
+  if(!GetOpenFileNameW(&ofn)) return;
+  HWND cs[6]={g_hSW,g_hSH,g_hSBG,g_hSFG,g_hSOK,g_hSOPEN};
+  for(int i=0;i<6;i++) if(cs[i]) DestroyWindow(cs[i]);
+  g_hSW=g_hSH=g_hSBG=g_hSFG=g_hSOK=g_hSOPEN=nullptr;
+  g_setup=false;
+  openTexelZipFile(path);
+  SetFocus(g_hwnd);
+}
+static void setupConfirm(){
+  wchar_t b[32]; uint32_t c;
+  GetWindowTextW(g_hSBG,b,32); if(!parseBg(b,&c)) c=g_bg;
+  GetWindowTextW(g_hSFG,b,32); uint32_t f; if(!parseColor(b,&f)) f=g_fg; f=argb(f);
+  HWND cs[6]={g_hSW,g_hSH,g_hSBG,g_hSFG,g_hSOK,g_hSOPEN};
+  for(int i=0;i<6;i++) if(cs[i]) DestroyWindow(cs[i]);
+  g_hSW=g_hSH=g_hSBG=g_hSFG=g_hSOK=g_hSOPEN=nullptr;
+  g_setup=false;
+  g_bg=c; g_fg=f; g_brush=argb(f); g_dirty=false;   // 不改变窗口/画布尺寸，只锁 + 收色
+  g_sw[0].color=g_brush; g_sw[1].color=argb(f); g_sw[2].color=argb(c);
+  refreshEdit(); refreshSize();
+  SetFocus(g_hwnd);
+  InvalidateRect(g_hwnd,nullptr,FALSE);
+}
+static void setupDrawLabels(){
+  if(!g_hSW) return;
+  int cx=g_cw/2, cy=g_ch/2;
+  int left=cx-95, top=cy-(4*24+36)/2;
+  const wchar_t* lb[4]={L"宽 (字):",L"高 (字):",L"背景色:",L"前景色:"};
+  HGDIOBJ oldF=SelectObject(g_memDC,g_uiFont);
+  int oldBk=SetBkMode(g_memDC,TRANSPARENT);
+  COLORREF oldTx=SetTextColor(g_memDC,RGB(0x20,0x20,0x20));
+  for(int i=0;i<4;i++){ RECT r={left, top+i*24+4, left+62, top+i*24+20}; DrawTextW(g_memDC,lb[i],-1,&r,DT_LEFT|DT_VCENTER|DT_SINGLELINE); }
+  SetTextColor(g_memDC,oldTx); SetBkMode(g_memDC,oldBk); SelectObject(g_memDC,oldF);
+}
+
 // ---------------- 窗口过程 ----------------
 static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
   switch(msg){
     case WM_ERASEBKGND: return 1;
 
+    case WM_SIZE:{
+      if(g_memDC){
+        int cw=LOWORD(lp), chh=HIWORD(lp);
+        if(cw>0&&chh>0){
+          g_cw=cw; g_ch=chh;
+          if(g_setup){
+            int W=cw/16; if(W<4)W=4;
+            int H=(chh-g_TB-g_SB)/16; if(H<1)H=1;
+            applyCanvasSize(W,H);
+            setFieldTexts(W,H);
+          }
+          computeLayout();                        // 水平居中 + 可见宽度
+          createDIB(); placeTopEdits();
+          if(g_setup) setupLayout();
+          InvalidateRect(hwnd,nullptr,FALSE);
+        }
+        return 0;
+      }
+      break;
+    }
+    case WM_GETMINMAXINFO:{
+      MINMAXINFO* mm=(MINMAXINFO*)lp;
+      if(g_setup){ mm->ptMinTrackSize.x=440; mm->ptMinTrackSize.y=280; }
+      else {
+        RECT rc={0,0,g_pw, g_TB+g_ph+g_SB};
+        AdjustWindowRectEx(&rc, GetWindowLongW(g_hwnd,GWL_STYLE), FALSE, 0);
+        mm->ptMinTrackSize.x=rc.right-rc.left; mm->ptMinTrackSize.y=rc.bottom-rc.top;
+      }
+      return 0;
+    }
+    case WM_COMMAND:{
+      int id=LOWORD(wp), code=HIWORD(wp);
+      if(g_setup){
+        if(code==EN_CHANGE && (id==IDC_SW||id==IDC_SH)){ setupApplySize(); return 0; }
+        if(code==BN_CLICKED && id==IDC_SOK){ setupConfirm(); return 0; }
+        if(code==BN_CLICKED && id==IDC_SOPEN){ setupOpen(); return 0; }
+      }
+      return 0;
+    }
+
     case WM_PAINT:{
       PAINTSTRUCT ps;
       HDC dc=BeginPaint(hwnd,&ps);
       RECT R=ps.rcPaint;
-      drawTopBar();                     // 顶栏/底栏很矮，整体重画即可
+      for(int yy=0;yy<g_ch;yy++){ uint32_t* pp=g_memBits+(size_t)yy*g_cw; for(int xx=0;xx<g_cw;xx++) pp[xx]=0xFFF0F0F0u; } // 留白
+      drawTopBar();
       drawStatusBar();
-      int cy0=R.top-g_TB; if(cy0<0)cy0=0;
-      int cy1=R.bottom-1-g_TB; if(cy1>g_ph-1)cy1=g_ph-1;
-      for(int y=cy0;y<=cy1;y++)         // 只拷画布受影响的行
-        memcpy(g_memBits+(size_t)(y+g_TB)*g_cw, g_fb.data()+(size_t)y*g_pw, (size_t)g_pw*4);
+      for(int y=0;y<g_visH;y++)         // 画布（水平/纵向居中，超出裁剪）
+        memcpy(g_memBits+(size_t)(g_canvasY+y)*g_cw+g_ox, g_fb.data()+(size_t)y*g_pw, (size_t)g_visW*4);
+      if(g_setup) setupDrawLabels();
       drawSelection();
       if(!caretInSel()) drawCaret();
       g_prevOverlay=overlayRectPx();
@@ -1528,13 +1876,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_LBUTTONDOWN:{
       SetFocus(hwnd);
       int x=GET_X_LPARAM(lp), y=GET_Y_LPARAM(lp);
+      if(g_setup && y>=g_TB) return 0;
       if(y<g_TB){
         if(x>=HELP_X && x<HELP_X+HELP_W && y>=HELP_Y && y<HELP_Y+HELP_H){ showHelp(); return 0; }
-        clickSwatch(x,y); return 0;
+        if(x>=0 && x<g_cw) clickSwatch(x,y);
+        return 0;
       }
-      if(y>=g_TB+g_ph){ int i=x/16; if(i>=0&&i<(int)g_ops.size()) setPos(i+1); return 0; }
-      int cy=y-g_TB;
-      int col=x/COLW, row=cy/ROWH;
+      if(y>=g_ch-g_SB){ if(x>=0&&x<g_cw){ int i=x/16; if(i>=0&&i<(int)g_ops.size()) setPos(i+1);} return 0; }
+      int cy=y-g_canvasY;
+      int col=(x-g_ox)/COLW, row=cy/ROWH;
       col=imin(imax(col,0),g_cols-1); row=imin(imax(row,0),g_H-1);
       if(g_cells[(size_t)row*g_cols+col]==CONT) col--;
       g_cx=col; g_cy=row;           // 按下即定位光标（点击/长按统一）
@@ -1548,21 +1898,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_MOUSEMOVE:{
       int x=GET_X_LPARAM(lp), y=GET_Y_LPARAM(lp);
+      int cx=x-g_ox;
+      if(g_setup) return 0;
       if(g_drawing){
-        int cy=y-g_TB;
+        int cy=y-g_canvasY;
         Stroke& st=g_strokes.back();
         int sx=st.pts.back().x, sy=st.pts.back().y;
         if(GetKeyState(VK_SHIFT)&0x8000){
           int ax=st.pts[0].x, ay=st.pts[0].y;
-          POINT e=snap8(ax,ay,x,cy);
+          POINT e=snap8(ax,ay,cx,cy);
           st.pts.clear(); st.pts.push_back({ax,ay}); st.pts.push_back(e);
           rebuildInk(); redrawAllCanvas();
         } else {
-          lineBuf(g_ink.data(),sx,sy,x,cy,g_size/2,g_brush);
-          st.pts.push_back({x,cy});
-          commitRect(brushRectPx(sx,sy,x,cy,g_size/2));
+          lineBuf(g_ink.data(),sx,sy,cx,cy,g_size/2,g_brush);
+          st.pts.push_back({cx,cy});
+          commitRect(brushRectPx(sx,sy,cx,cy,g_size/2));
         }
-        g_last.x=x; g_last.y=cy;
+        g_last.x=cx; g_last.y=cy;
         return 0;
       }
       if(g_lbtnDown){
@@ -1571,7 +1923,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
           if(dx*dx+dy*dy>64){ g_selecting=true; KillTimer(hwnd,2); }
         }
         if(g_selecting){
-          int col=x/COLW, row=(y-g_TB)/ROWH;
+          int col=cx/COLW, row=(y-g_canvasY)/ROWH;
           col=imin(imax(col,0),g_cols-1); row=imin(imax(row,0),g_H-1);
           g_selC1=col; g_selR1=row;
           overlayChanged();
@@ -1592,21 +1944,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_RBUTTONDOWN:{
       int x=GET_X_LPARAM(lp), y=GET_Y_LPARAM(lp);
-      if(y<g_TB||y>=g_TB+g_ph) return 0;
+      if(g_setup) return 0;
+      if(y<g_TB||y>=g_ch-g_SB) return 0;
+      int cx=x-g_ox; if(cx<0||cx>=g_pw) return 0;
       g_hasSel=false;
-      int cy=y-g_TB;
+      int cy=y-g_canvasY;
       truncateFuture();
       g_drawing=true; SetCapture(hwnd);
-      g_last.x=x; g_last.y=cy;
-      Stroke st; st.color=g_brush; st.size=g_size; st.pts.push_back({x,cy});
+      g_last.x=cx; g_last.y=cy;
+      Stroke st; st.color=g_brush; st.size=g_size; st.pts.push_back({cx,cy});
       g_strokes.push_back(st);
       Op op; op.type=OP_STROKE; op.color=g_brush; op.size=g_size;
-      op.pts.push_back({x,cy}); op.cbx1=g_cx; op.cby1=g_cy;
+      op.pts.push_back({cx,cy}); op.cbx1=g_cx; op.cby1=g_cy;
       pushOp(op);
-      stampBuf(g_ink.data(),x,cy,g_size/2,g_brush);
+      stampBuf(g_ink.data(),cx,cy,g_size/2,g_brush);
       g_dirty=true;
       overlayChanged();
-      commitRect(brushRectPx(x,cy,x,cy,g_size/2));
+      commitRect(brushRectPx(cx,cy,cx,cy,g_size/2));
       return 0;
     }
     case WM_RBUTTONUP:{
@@ -1617,9 +1971,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       return 0;
     }
     case WM_DROPFILES:{
+      if(g_setup){ DragFinish((HDROP)wp); return 0; }   // 新建前拖动不生效
       std::vector<std::wstring> fs=hdropFiles((HANDLE)wp);
       RECT r=emptyRectPx();
-      for(auto& p:fs) if(endsWithZW(p,L".texel.zip")){ r=pasteTexelZipFile(p.c_str()); break; }
+      for(auto& p:fs){ r=pasteDroppedFile(p.c_str()); if(!rectEmpty(r)) break; }
       DragFinish((HDROP)wp);
       commitRect(r); overlayChanged();
       return 0;
@@ -1628,6 +1983,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
     case WM_MOUSEWHEEL:{
       int dz=GET_WHEEL_DELTA_WPARAM(wp);
+      if(g_setup) return 0;
       DWORD now=GetTickCount();
       DWORD dt=now-g_wheelT; g_wheelT=now;            // 距上次滚轮的间隔(ms)
       if(dt>1000) dt=1000; if(dt<1) dt=1;
@@ -1653,13 +2009,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
 
     case WM_KEYDOWN:{
+      if(g_setup) return 0;
       if(imeComposing(hwnd)) return DefWindowProc(hwnd,msg,wp,lp);
       if(GetKeyState(VK_CONTROL)&0x8000){
         if(wp=='Z'){ doUndo(); return 0; }
         if(wp=='Y'){ setPos(g_pos+1); return 0; }
         if(wp=='S'){ saveFile(); return 0; }
-        if(wp=='O'){ openZipNewProcess(); return 0; }
-        if(wp=='N'){ if(g_skipNew || askParams()) setupCanvas(g_W,g_H,g_bg,g_fg); return 0; }
         if(wp=='C'){ doCopy(); return 0; }
         if(wp=='X'){ RECT r=doCut(); commitRect(r); overlayChanged(); return 0; }
         if(wp=='A'){ g_hasSel=true; g_selecting=false; g_selC0=0; g_selC1=g_cols-1; g_selR0=0; g_selR1=g_H-1; overlayChanged(); return 0; }
@@ -1685,6 +2040,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       return 0;
     }
     case WM_CHAR:{
+      if(g_setup) return 0;
       wchar_t ch=(wchar_t)wp;
       uint32_t cp;
       if((uint32_t)ch>=0xD800 && (uint32_t)ch<=0xDBFF){ g_pendingHigh=ch; return 0; }   // 高代理，等低位
@@ -1717,7 +2073,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
       DestroyWindow(hwnd);
       return 0;
 
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_DESTROY: RevokeDragDrop(hwnd); PostQuitMessage(0); return 0;
   }
   return DefWindowProc(hwnd,msg,wp,lp);
 }
@@ -1726,15 +2082,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   g_hInst=hInst;
   SetProcessDPIAware();
+  OleInitialize(nullptr);
   GdiplusStartupInput gi; ULONG_PTR tok=0;
   GdiplusStartup(&tok,&gi,nullptr);
   g_cfCells=RegisterClipboardFormatW(L"texel-cellblock");
   g_cfPNG=RegisterClipboardFormatW(L"PNG");
+  g_cfDragImageBits=RegisterClipboardFormatW(L"DragImageBits");
+  g_cfFileContents=RegisterClipboardFormatW(L"FileContents");
 
   loadConfig();
   std::wstring startFile;
   { int ac=0; LPWSTR* av=CommandLineToArgvW(GetCommandLineW(),&ac); if(av){ if(ac>=2) startFile=av[1]; LocalFree(av); } }
-  if(startFile.empty() && !g_skipNew && !askParams()) return 0;
+  bool setupMode=startFile.empty();
 
   WNDCLASSEXW wc; memset(&wc,0,sizeof(wc));
   wc.cbSize=sizeof(wc);
@@ -1750,10 +2109,10 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   g_cols=g_W*2;
   g_pw=g_W*16; g_ph=g_H*16; g_cw=g_pw; g_ch=g_TB+g_ph+g_SB;
 
+  DWORD wstyle=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_CLIPCHILDREN|WS_THICKFRAME|WS_MAXIMIZEBOX;
   RECT rc={0,0,g_cw,g_ch};
-  AdjustWindowRectEx(&rc, WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_CLIPCHILDREN, FALSE, 0);
-  g_hwnd=CreateWindowExW(0,L"TexelClass",L"字画",
-      WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_CLIPCHILDREN,
+  AdjustWindowRectEx(&rc, wstyle, FALSE, 0);
+  g_hwnd=CreateWindowExW(0,L"TexelClass",L"字画", wstyle,
       CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
       nullptr,nullptr,hInst,nullptr);
   if(!g_hwnd) return 0;
@@ -1783,6 +2142,7 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
     colorW=cw*8+edge*2+6;
     SelectObject(mdc,of); DeleteDC(mdc); }
   sizeX=40; colorX=sizeX+sizeW+6; g_swatchX0=colorX+colorW+8;
+  g_editSizeX=sizeX; g_editSizeW=sizeW; g_colorX=colorX; g_colorW=colorW;
 
   g_hEditSize=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
       WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|ES_NUMBER,
@@ -1797,10 +2157,12 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   SendMessageW(g_hEdit,WM_SETFONT,(WPARAM)g_uiFont,TRUE);
 
   setupCanvas(g_W,g_H,g_bg,g_fg);
-  if(!startFile.empty()) openTexelZipFile(startFile.c_str());
+  if(setupMode){ g_setup=true; setupCreateControls(); }
+  else if(!startFile.empty()) openTexelZipFile(startFile.c_str());
   placeWindow();
 
   DragAcceptFiles(g_hwnd,TRUE);
+  { TexelDropTarget* dt=new TexelDropTarget(); RegisterDragDrop(g_hwnd,dt); dt->Release(); }
   ShowWindow(g_hwnd,SW_SHOW);
   UpdateWindow(g_hwnd);
   SetFocus(g_hwnd);
@@ -1810,5 +2172,6 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
 
   saveConfig();
   GdiplusShutdown(tok);
+  OleUninitialize();
   return 0;
 }
