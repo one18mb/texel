@@ -121,6 +121,7 @@ static int    g_winX = 0, g_winY = 0;
 static bool   g_hasPos = false;
 static POINT  g_last = {0,0};
 static int    g_swatchX0 = 130, g_swatchY0 = 5, g_swPitch = 16, g_swSz = 14;
+static int    g_minWinW = 0, g_minWinH = 0;   // 窗口最小客户区尺寸（宽=放得下全部默认色块，高=放得下设置控件）
 
 // 选中
 static bool   g_lbtnDown=false, g_selecting=false, g_hasSel=false;
@@ -1303,8 +1304,8 @@ static void openTexelZipFile(const wchar_t* path){
   uint32_t bg=0x00FFFFFF;
   if(!readTexelZip(path,tb,cb,ink,iw,ih,&bg)) return;
   if(iw%COLW||ih%ROWH) return;
-  int cols=iw/COLW, W=cols/2, H=ih/ROWH;
-  if(W<4||H<1||W>512||H>512) return;
+  int cols=iw/COLW, W=cols, H=ih/ROWH;
+  if(W<2||H<1) return;
   g_bg=bg; g_fg=0x000000;
   setupCanvas(W,H,g_bg,g_fg);
   if((int)ink.size()==g_pw*g_ph) g_ink=ink;
@@ -1563,8 +1564,8 @@ static void loadConfig(){
   wchar_t b[16]; uint32_t c;
   GetPrivateProfileStringW(L"cfg",L"Bg",L"trans",b,16,p); { uint32_t x; if(parseBg(b,&x)) g_bg=x; }
   GetPrivateProfileStringW(L"cfg",L"Fg",L"000000",b,16,p); if(parseColor(b,&c)) g_fg=c;
-  if(g_W<4) g_W=4; if(g_W>512) g_W=512;
-  if(g_H<1) g_H=1; if(g_H>512) g_H=512;
+  if(g_W<2) g_W=2;
+  if(g_H<1) g_H=1;
 }
 static void saveConfig(){
   wchar_t p[MAX_PATH]; configPath(p,MAX_PATH);
@@ -1587,7 +1588,7 @@ L"字画 texel —— 极简像素草稿本\r\n"
 L"\r\n"
 L"【画布】\r\n"
 L"  窗口始终可缩放；画布尺寸在『新建』时确定后锁定，随窗口居中。\r\n"
-L"  单位『字』= 16×16 像素（半角 8px / 全角 16px）。\r\n"
+L"  宽单位 = 半角列(8px)；高单位 = 行(16px)；全角字占 2 列。\r\n"
 L"  背景色 = 画布底色（留空/trans = 透明，导出 PNG 带透明通道；屏幕显示为白）。\r\n"
 L"\r\n"
 L"【图层】笔迹层在下，文字层在上（文字盖住笔迹）。\r\n"
@@ -1660,8 +1661,8 @@ static void createDIB(){
 }
 static void setupCanvas(int W,int H,uint32_t bg,uint32_t fg){
   g_W=W; g_H=H; g_bg=bg; g_fg=fg;
-  g_cols=W*2;
-  g_pw=W*16; g_ph=H*16; g_cw=g_pw; g_ch=g_TB+g_ph+g_SB; g_ox=0; g_visW=g_pw; g_canvasY=g_TB; g_visH=g_ph;
+  g_cols=W;
+  g_pw=W*8; g_ph=H*16; g_cw=g_pw; g_ch=g_TB+g_ph+g_SB; g_ox=0; g_visW=g_pw; g_canvasY=g_TB; g_visH=g_ph;
   g_cells.assign((size_t)g_H*g_cols,0u);
   g_cellColor.assign((size_t)g_H*g_cols,0u);
   g_ink.assign((size_t)g_pw*g_ph,0u);
@@ -1709,7 +1710,7 @@ static LRESULT CALLBACK SetupEditProc(HWND h,UINT m,WPARAM w,LPARAM l){
   return CallWindowProc(g_editProc,h,m,w,l);
 }
 static void applyCanvasSize(int W,int H){
-  g_W=W; g_H=H; g_cols=W*2; g_pw=W*16; g_ph=H*16;
+  g_W=W; g_H=H; g_cols=W; g_pw=W*8; g_ph=H*16;
   g_cells.assign((size_t)g_H*g_cols,0u);
   g_cellColor.assign((size_t)g_H*g_cols,0u);
   g_ink.assign((size_t)g_pw*g_ph,0u);
@@ -1739,10 +1740,10 @@ static void setFieldTexts(int W,int H){
 static void setupApplySize(){
   if(g_setupBusy) return;
   g_setupBusy=true;
-  int Wmax=g_cw/16; if(Wmax<4)Wmax=4;                  // 上限 = 当前窗口可容纳的最大值
+  int Wmax=g_cw/8; if(Wmax<2)Wmax=2;                   // 上限 = 当前窗口可容纳的最大列数
   int Hmax=(g_ch-g_TB-g_SB)/16; if(Hmax<1)Hmax=1;
   wchar_t b[32];
-  GetWindowTextW(g_hSW,b,32); int W=_wtoi(b); if(W<4)W=4; if(W>Wmax)W=Wmax;
+  GetWindowTextW(g_hSW,b,32); int W=_wtoi(b); if(W<2)W=2; if(W>Wmax)W=Wmax;
   GetWindowTextW(g_hSH,b,32); int H=_wtoi(b); if(H<1)H=1; if(H>Hmax)H=Hmax;
   applyCanvasSize(W,H);                       // 只改画布，不改窗口
   computeLayout();
@@ -1816,7 +1817,7 @@ static void setupDrawLabels(){
   if(!g_hSW) return;
   int cx=g_cw/2, cy=g_ch/2;
   int left=cx-95, top=cy-(4*24+36)/2;
-  const wchar_t* lb[4]={L"宽 (字):",L"高 (字):",L"背景色:",L"前景色:"};
+  const wchar_t* lb[4]={L"宽 (半角):",L"高 (行):",L"背景色:",L"前景色:"};
   HGDIOBJ oldF=SelectObject(g_memDC,g_uiFont);
   int oldBk=SetBkMode(g_memDC,TRANSPARENT);
   COLORREF oldTx=SetTextColor(g_memDC,RGB(0x20,0x20,0x20));
@@ -1835,7 +1836,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(cw>0&&chh>0){
           g_cw=cw; g_ch=chh;
           if(g_setup){
-            int W=cw/16; if(W<4)W=4;
+            int W=cw/8; if(W<2)W=2;
             int H=(chh-g_TB-g_SB)/16; if(H<1)H=1;
             applyCanvasSize(W,H);
             setFieldTexts(W,H);
@@ -1851,12 +1852,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_GETMINMAXINFO:{
       MINMAXINFO* mm=(MINMAXINFO*)lp;
-      if(g_setup){ mm->ptMinTrackSize.x=440; mm->ptMinTrackSize.y=280; }
-      else {
-        RECT rc={0,0,g_pw, g_TB+g_ph+g_SB};
-        AdjustWindowRectEx(&rc, GetWindowLongW(g_hwnd,GWL_STYLE), FALSE, 0);
-        mm->ptMinTrackSize.x=rc.right-rc.left; mm->ptMinTrackSize.y=rc.bottom-rc.top;
-      }
+      RECT rc={0,0,g_minWinW,g_minWinH};                              // 最小：宽=默认色块全显示，高=设置控件全显示
+      AdjustWindowRectEx(&rc, GetWindowLongW(hwnd,GWL_STYLE), FALSE, 0);
+      mm->ptMinTrackSize.x=rc.right-rc.left;
+      mm->ptMinTrackSize.y=rc.bottom-rc.top;
+      RECT wa; SystemParametersInfoW(SPI_GETWORKAREA,0,&wa,0);        // 最大：不超出屏幕工作区
+      mm->ptMaxTrackSize.x=wa.right-wa.left;
+      mm->ptMaxTrackSize.y=wa.bottom-wa.top;
       return 0;
     }
     case WM_COMMAND:{
@@ -2123,8 +2125,16 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
   wc.lpszClassName=L"TexelClass";
   RegisterClassExW(&wc);
 
-  g_cols=g_W*2;
-  g_pw=g_W*16; g_ph=g_H*16; g_cw=g_pw; g_ch=g_TB+g_ph+g_SB;
+  g_cols=g_W;
+  g_pw=g_W*8; g_ph=g_H*16;
+  g_cw=g_pw; g_ch=g_TB+g_ph+g_SB;
+  {   // 窗口不超屏幕；画布随之 clamp
+    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA,0,&wa,0);
+    if(g_cw>wa.right-wa.left) g_cw=wa.right-wa.left;
+    if(g_ch>wa.bottom-wa.top) g_ch=wa.bottom-wa.top;
+    if(g_cw<g_pw){ g_W=g_cw/8; if(g_W<2)g_W=2; g_cols=g_W; g_pw=g_W*8; }
+    if(g_ch<g_TB+g_ph+g_SB){ g_H=(g_ch-g_TB-g_SB)/16; if(g_H<1)g_H=1; g_ph=g_H*16; }
+  }
 
   DWORD wstyle=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_CLIPCHILDREN|WS_THICKFRAME|WS_MAXIMIZEBOX;
   RECT rc={0,0,g_cw,g_ch};
@@ -2160,6 +2170,19 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,LPWSTR,int){
     SelectObject(mdc,of); DeleteDC(mdc); }
   sizeX=40; colorX=sizeX+sizeW+6; g_swatchX0=colorX+colorW+8;
   g_editSizeX=sizeX; g_editSizeW=sizeW; g_colorX=colorX; g_colorW=colorW;
+  g_minWinW=g_swatchX0 + 20*g_swPitch + 8;   // 固定色块(当前/前景/背景/透明/经典16)全显示
+  g_minWinH=g_TB + 132 + g_SB;                // 顶栏 + 设置控件(4字段+按钮) + 底栏
+  {   // 窗口初始若小于最小下界，扩到最小（画布保持按 ini，居中留白）
+    RECT cr; GetClientRect(g_hwnd,&cr);
+    if(cr.right-cr.left < g_minWinW || cr.bottom-cr.top < g_minWinH){
+      int nw=imax(cr.right-cr.left, g_minWinW), nh=imax(cr.bottom-cr.top, g_minWinH);
+      RECT wr={0,0,nw,nh};
+      AdjustWindowRectEx(&wr, GetWindowLongW(g_hwnd,GWL_STYLE), FALSE, 0);
+      SetWindowPos(g_hwnd,nullptr,0,0,wr.right-wr.left,wr.bottom-wr.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+      RECT cr2; GetClientRect(g_hwnd,&cr2);
+      g_cw=cr2.right-cr2.left; g_ch=cr2.bottom-cr2.top;
+    }
+  }
 
   g_hEditSize=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
       WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|ES_NUMBER,
