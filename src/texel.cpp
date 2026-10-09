@@ -616,7 +616,8 @@ static RECT pasteBlob(int rows,int cols,const uint32_t* cp,const uint32_t* co,in
     if(px<g_pw&&py<g_ph) g_ink[(size_t)py*g_pw+px]=a;
   }
   snapAfter(op); snapInkAfter(op);
-  int caretC=imin(g_cx+cols, g_cols-1);                       // 向右水平平移选区列跨度，行不动
+  int caretC=g_cx;                                            // 默认锚点对齐：光标不动
+  if(anchorC>=0 && anchorR>=0) caretC=imin(g_cx+cols, g_cols-1);  // 锚点在左上角 → 右侧连续
   op.cbx0=g_cx; op.cby0=g_cy; op.cbx1=caretC; op.cby1=g_cy;
   pushOp(op);
   g_cx=caretC; selCaret();
