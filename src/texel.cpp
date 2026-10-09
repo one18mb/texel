@@ -1793,6 +1793,7 @@ static void setupConfirm(){
   g_setup=false;
   g_bg=c; g_fg=f; g_brush=argb(f); g_dirty=false;   // 不改变窗口/画布尺寸，只锁 + 收色
   g_sw[0].color=g_brush; g_sw[1].color=argb(f); g_sw[2].color=argb(c);
+  compose();                                        // 背景色变了，重新合成整帧
   refreshEdit(); refreshSize();
   SetFocus(g_hwnd);
   InvalidateRect(g_hwnd,nullptr,FALSE);
