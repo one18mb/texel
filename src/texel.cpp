@@ -343,7 +343,7 @@ static void clearGlyphAt(int row,int col){
   if(w==2 && start+1<g_cols){ g_cells[(size_t)row*g_cols+start+1]=0; g_cellColor[(size_t)row*g_cols+start+1]=0; }
 }
 static void truncateFuture(){ if((int)g_ops.size()>g_pos) g_ops.resize(g_pos); }
-static int timelineCap(){ int c=g_visW/16; return c<1?1:c; }
+static int timelineCap(){ int c=(g_cw-STATUS_COORD_W)/16; return c<1?1:c; }
 static void baseReset(){
   g_baseCells.assign((size_t)g_H*g_cols,0u);
   g_baseCellColor.assign((size_t)g_H*g_cols,0u);
